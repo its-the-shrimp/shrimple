@@ -1,0 +1,67 @@
+$(EEEE)
+<$ref $SHRIMP="/shrimp-alpha.png" />
+<$define $SHRIMP_SIZE=100 />
+<$defineElement name=BODY acceptsChildren $title="The Shrimp">
+    <!DOCTYPE html>
+    <html>
+        <head>
+            <link rel=stylesheet href=$(xref("index.css")) />
+            <title><$title /></title>
+        </head>
+        <body>
+            <svg class=bg width=$SHRIMP_SIZE height=100%>
+                <pattern
+                    id=shrimp
+                    width=$SHRIMP_SIZE height="$(SHRIMP_SIZE 2 *)"
+                    patternUnits=userSpaceOnUse
+                >
+                    <image
+                        href=$SHRIMP
+                        width=$SHRIMP_SIZE height=$SHRIMP_SIZE
+                        transform="rotate(-30 $(SHRIMP_SIZE 2 /) $(SHRIMP_SIZE 2 /))"
+                    />
+                    <image
+                        href=$SHRIMP
+                        y=$SHRIMP_SIZE
+                        width=$SHRIMP_SIZE height=$SHRIMP_SIZE
+                        transform="rotate(30 $(SHRIMP_SIZE 2 /) $(SHRIMP_SIZE 2 / SHRIMP_SIZE +))"
+                    />
+                </pattern>
+                <rect width=100% height=100% fill=url(#shrimp) />
+            </svg>
+            <svg class="bg pin-right" width=$SHRIMP_SIZE height=100%>
+                <pattern
+                    id=shrimp
+                    width=$SHRIMP_SIZE height="$(SHRIMP_SIZE 2 *)"
+                    patternUnits=userSpaceOnUse
+                >
+                    <image
+                        href=$SHRIMP
+                        width=$SHRIMP_SIZE height=$SHRIMP_SIZE
+                        transform="rotate(-30 $(SHRIMP_SIZE 2 /) $(SHRIMP_SIZE 2 /))"
+                    />
+                    <image
+                        href=$SHRIMP
+                        y=$SHRIMP_SIZE
+                        width=$SHRIMP_SIZE height=$SHRIMP_SIZE
+                        transform="rotate(30 $(SHRIMP_SIZE 2 /) $(SHRIMP_SIZE 2 / SHRIMP_SIZE +))"
+                    />
+                </pattern>
+                <rect width=100% height=100% fill=url(#shrimp) />
+            </svg>
+            <div class="fg">
+                <$children />
+            </div>
+        </body>
+    </html>
+</$define>
+
+<$BODY>
+    <div class="underlined title">The Shrimp</div>
+    <p>Hi, I'm Tim "The Shrimp" Kurdov, a self-taught programmer based in Lisbon, Portugal</p>
+    <$foreach $POST in dir=posts>
+        <div class=post>
+            <a href=$(xref(POST))>Post 0</a>
+        </div>
+    </$foreach>
+</$BODY>

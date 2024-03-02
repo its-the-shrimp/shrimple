@@ -1,0 +1,9 @@
+[package]
+name = "shrimple"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nom = "7"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }

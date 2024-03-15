@@ -1,12 +1,14 @@
-use std::ops::{RangeTo, RangeFrom};
+use std::borrow::Cow;
+use std::fmt::{self, Debug, Display, Formatter};
+use std::ops::{RangeFrom, RangeTo};
 
-use nom::{IResult, InputIter, AsChar, InputLength};
 use nom::character::complete::{char, satisfy};
-use nom::error::{ParseError, ErrorKind as NomErrorKind, Error as NomError};
-use nom::multi::{many1_count, many0_count};
-use nom::sequence::preceded;
-use nom::{Parser, Slice, Offset};
-use nom::combinator::{recognize, cut, opt, peek};
+use nom::combinator::{cut, opt, peek, recognize};
+use nom::error::{Error as NomError, ErrorKind as NomErrorKind, ParseError};
+use nom::multi::many1_count;
+use nom::sequence::{delimited, preceded};
+use nom::{AsChar, IResult, InputIter, InputLength};
+use nom::{Offset, Parser, Slice};
 
 pub type Result<T = (), E = anyhow::Error> = std::result::Result<T, E>;
 
@@ -24,37 +26,12 @@ pub trait ParserExt<I, O>: Sized + Parser<I, O, NomError<I>> {
         self.and(other).map(|(prev, _)| prev)
     }
 
-    /// `preceded()` as a method
-    fn and_replace<O2>(self, next: impl Parser<I, O2, NomError<I>>) -> impl Parser<I, O2, NomError<I>> {
-        preceded(self, next)
-    }
-
     /// turns a recoverable error into a success value with `None` as the output
     fn opt(self) -> impl Parser<I, Option<O>, NomError<I>>
     where
         I: Clone,
     {
         opt(self)
-    }
-
-    /// on recoverable error: output is `true`, on success: output is `false`
-    fn failed(self) -> impl Parser<I, bool, NomError<I>>
-    where
-        I: Clone,
-    {
-        self.opt().map(|r| r.is_none())
-    }
-
-    fn cut(self) -> impl Parser<I, O, NomError<I>> {
-        cut(self)
-    }
-
-    fn trim_whitespace(self) -> impl Parser<I, O, NomError<I>>
-    where
-        I: Slice<RangeFrom<usize>> + InputIter + Clone + InputLength,
-        <I as InputIter>::Item: AsChar,
-    {
-        self.trim(many0_count(satisfy(|c: char| c.is_ascii_whitespace())))
     }
 
     fn peek<P>(self, parser: impl Parser<I, P, NomError<I>>) -> impl Parser<I, O, NomError<I>>
@@ -67,16 +44,12 @@ pub trait ParserExt<I, O>: Sized + Parser<I, O, NomError<I>> {
 
 impl<I, O, T: Parser<I, O, NomError<I>>> ParserExt<I, O> for T {}
 
-pub fn eq<T: Eq + ?Sized>(second: &T) -> impl Fn(&T) -> bool + '_ {
-    move |x| x == second
-}
-
-pub fn whitespace<I>(input: I) -> IResult<I, ()>
+pub fn whitespace<I>(input: I) -> IResult<I, I>
 where
-    I: Slice<RangeFrom<usize>> + InputIter + Clone + InputLength,
+    I: Slice<RangeTo<usize>> + Slice<RangeFrom<usize>> + InputIter + Clone + InputLength + Offset,
     <I as InputIter>::Item: AsChar,
 {
-    many1_count(satisfy(|c: char| c.is_ascii_whitespace())).map(drop).parse(input)
+    many1_count(satisfy(|c: char| c.is_ascii_whitespace())).recognize().parse(input)
 }
 
 pub fn group(open: char, close: char) -> impl Fn(&str) -> IResult<&str, &str> {
@@ -87,7 +60,7 @@ pub fn group(open: char, close: char) -> impl Fn(&str) -> IResult<&str, &str> {
             if ch == close {
                 if depth == 0 {
                     let (res, src) = src.split_at(at);
-                    return Ok((&src[1..], res))
+                    return Ok((&src[1..], res));
                 }
                 depth -= 1
             } else if ch == open {
@@ -101,7 +74,57 @@ pub fn group(open: char, close: char) -> impl Fn(&str) -> IResult<&str, &str> {
 /// equivalent to `preceded(first, cut(second))`
 pub fn prefixed<I, P, O, E: ParseError<I>>(
     first: impl Parser<I, P, E>,
-    second: impl Parser<I, O, E>
+    second: impl Parser<I, O, E>,
 ) -> impl FnMut(I) -> IResult<I, O, E> {
     preceded(first, cut(second))
+}
+
+/// equivalent to `delimited(prefix, cut(main), cut(postfix))`
+pub fn surrounded<I, Prefix, O, Postfix, E: ParseError<I>>(
+    first: impl Parser<I, Prefix, E>,
+    main: impl Parser<I, O, E>,
+    postfix: impl Parser<I, Postfix, E>,
+) -> impl FnMut(I) -> IResult<I, O, E> {
+    delimited(first, cut(main), cut(postfix))
+}
+
+pub fn cow_into<'data, T, U>(src: Cow<'data, T>) -> Cow<'data, U>
+where
+    T: AsRef<U> + ToOwned + 'data + ?Sized,
+    U: ToOwned + 'data + ?Sized,
+    T::Owned: Into<U::Owned>,
+{
+    match src {
+        Cow::Borrowed(r) => Cow::Borrowed(r.as_ref()),
+        Cow::Owned(o) => Cow::Owned(o.into()),
+    }
+}
+
+/// Exists to compare/print strings as if they had an additional char `P` before them, without
+/// allocating
+#[repr(transparent)]
+#[derive(Debug)]
+pub struct Prefixed<const P: char, T>(pub T);
+
+impl<const P: char, T: PartialEq<str>> PartialEq<str> for Prefixed<P, T> {
+    fn eq(&self, other: &str) -> bool {
+        other.strip_prefix(P).is_some_and(|rest| self.0 == *rest)
+    }
+}
+
+impl<'str, const P: char, T: PartialEq<&'str str>> PartialEq<&'str str> for Prefixed<P, T> {
+    fn eq(&self, other: &&'str str) -> bool {
+        other.strip_prefix(P).is_some_and(|rest| self.0 == rest)
+    }
+}
+
+impl<const P: char, T: Display> Display for Prefixed<P, T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        Display::fmt(&P, f)?;
+        Display::fmt(&self.0, f)
+    }
+}
+
+pub fn default<T: Default>() -> T {
+    T::default()
 }

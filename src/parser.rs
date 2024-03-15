@@ -1,125 +1,244 @@
-use std::{error::Error, path::Path};
-use crate::error::ErrorWithSource;
-use nom::{
-    IResult,
-    character::complete::{char, satisfy},
-    Parser,
-    combinator::map,
-    multi::{many0_count, separated_list0, many1_count, many1},
-    bytes::complete::{is_not, tag},
-    sequence::delimited, branch::alt,
+use crate::{
+    error::Locator,
+    utils::{group, prefixed, surrounded, whitespace, ParserExt, Result},
 };
-use crate::utils::{ParserExt, prefixed, whitespace, group};
+use nom::{
+    branch::alt,
+    bytes::complete::{is_not, tag},
+    character::complete::{char, satisfy},
+    combinator::map,
+    multi::{many0_count, many1_count},
+    sequence::{delimited, preceded},
+    IResult, Parser,
+};
+use std::{
+    fmt::{self, Debug, Display, Formatter},
+    marker::PhantomData,
+    ptr::null,
+};
 
-#[derive(Debug, PartialEq, Eq, Default)]
+#[derive(Debug, PartialEq, Eq, Default, Clone, Copy)]
 pub enum AttrValue<'src> {
     /// No value
     #[default]
     None,
-    /// Without the quotes
-    String(&'src str),
     /// Without the `$`
     Var(&'src str),
     /// Without the `$()`
     Expr(&'src str),
-    /// Anything else, just a word termimated by whitespace, `/` or `>`
+    /// String literal or a word terminated by whitespace, `/`, `>`
     Text(&'src str),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+impl Display for AttrValue<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => Ok(()),
+            Self::Var(name) => write!(f, "${name}"),
+            Self::Expr(expr) => write!(f, "$({expr})"),
+            Self::Text(text) => Debug::fmt(text, f),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct Attr<'src> {
     pub name: &'src str,
     pub value: AttrValue<'src>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct Element<'src> {
-    pub name: &'src str,
-    pub attrs: Vec<Attr<'src>>,
-    pub has_children: bool,
+impl Display for Attr<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if matches!(self.value, AttrValue::None) {
+            Display::fmt(self.name, f)
+        } else {
+            write!(f, "{}={}", self.name, self.value)
+        }
+    }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum XmlFragment<'src> {
-    ElementStart(Element<'src>),
-    ElementEnd(&'src str),
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum XmlFragment<'src, Cmd = ()> {
+    /// <tagname
+    OpeningTagStart(&'src str),
+    /// `key=value` or key
+    Attr(Attr<'src>),
+    /// `/>` or `>`
+    OpeningTagEnd(&'src str),
+    /// </tagname>
+    ClosingTag(&'src str),
+    /// $VARNAME
     Var(&'src str),
+    /// $(LUA CODE)
     Expr(&'src str),
+    /// any other text
     Text(&'src str),
+    /// used by the evaluator
+    Internal(Cmd),
+}
+
+impl<Cmd: Display> Display for XmlFragment<'_, Cmd> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OpeningTagStart(name) => write!(f, "<{}", name),
+            Self::Attr(attr) => Display::fmt(attr, f),
+            Self::OpeningTagEnd(s) => Display::fmt(s, f),
+            Self::ClosingTag(name) => write!(f, "</{}>", name),
+            Self::Var(name) => write!(f, "${}", name),
+            Self::Expr(expr) => write!(f, "$({})", expr),
+            Self::Text(text) => Display::fmt(text, f),
+            Self::Internal(i) => write!(f, "$__internal({i})"),
+        }
+    }
+}
+
+impl<Cmd> XmlFragment<'_, Cmd> {
+    /// For error reporting
+    pub fn as_src_ptr(&self) -> *const u8 {
+        match self {
+            Self::OpeningTagStart(s)
+            | Self::Attr(Attr { name: s, .. })
+            | Self::OpeningTagEnd(s)
+            | Self::ClosingTag(s)
+            | Self::Var(s)
+            | Self::Expr(s)
+            | Self::Text(s) => s.as_ptr(),
+            Self::Internal(_) => null(),
+        }
+    }
 }
 
 fn ident_char(input: &str) -> IResult<&str, char> {
     satisfy(|c: char| c.is_alphanumeric() || c == '_')(input)
 }
 
-fn ident(input: &str) -> IResult<&str, &str> {
-    ident_char.or(char('$')).and(many0_count(ident_char)).recognize().parse(input)
-}
-
 fn word(input: &str) -> IResult<&str, &str> {
     is_not(" \t\n/>")(input)
+}
+
+fn prefix(input: &str) -> IResult<&str, char> {
+    char('$').parse(input)
 }
 
 fn string_literal(input: &str) -> IResult<&str, &str> {
     delimited(char('"'), is_not("\""), char('"')).parse(input)
 }
 
-fn attr_value(input: &str) -> IResult<&str, AttrValue> {
-    map(template_expr, AttrValue::Expr)
-        .or(map(template_var, AttrValue::Var))
-        .or(map(string_literal, AttrValue::String))
-        .or(map(word, AttrValue::Text))
-        .parse(input)
+fn attr_name(input: &str) -> IResult<&str, &str> {
+    ident_char.or(prefix).and(many0_count(ident_char)).recognize().parse(input)
 }
 
-fn kv_pair(input: &str) -> IResult<&str, Attr> {
-    ident
+fn attr_value(input: &str) -> IResult<&str, AttrValue> {
+    alt((
+        map(template_expr, AttrValue::Expr),
+        map(template_var, AttrValue::Var),
+        map(string_literal, AttrValue::Text),
+        map(word, AttrValue::Text),
+    ))(input)
+}
+
+fn attr(input: &str) -> IResult<&str, Attr> {
+    attr_name
         .and(prefixed(char('='), attr_value).opt())
         .map(|(name, value)| Attr { name, value: value.unwrap_or_default() })
         .parse(input)
 }
 
 fn template_var(input: &str) -> IResult<&str, &str> {
-    prefixed(char('$'), many1_count(ident_char).recognize())(input)
+    prefixed(prefix, many1_count(ident_char).recognize())(input)
 }
 
 fn template_expr(input: &str) -> IResult<&str, &str> {
-    prefixed(char('$').peek(char('(')), group('(', ')'))(input)
+    prefixed(prefix.peek(char('(')), group('(', ')'))(input)
 }
 
-fn element_start(input: &str) -> IResult<&str, Element> {
-    prefixed(
-        char('<'),
-        word
-            .trim_whitespace()
-            .and(separated_list0(whitespace, kv_pair))
-            .trim_whitespace()
-            .and(char('/').failed())
-            .trim(char('>'))
-            .map(|((name, attrs), has_children)| Element { name, attrs, has_children })
+/// the output is the element name
+fn opening_tag_start(input: &str) -> IResult<&str, &str> {
+    prefixed(char('<'), word)(input)
+}
+
+fn closing_tag(input: &str) -> IResult<&str, &str> {
+    surrounded(tag("</"), word, char('>'))(input)
+}
+
+fn xml_fragment<Cmd>(input: &str) -> IResult<&str, XmlFragment<Cmd>> {
+    alt((
+        map(closing_tag, XmlFragment::ClosingTag),
+        map(opening_tag_start, XmlFragment::OpeningTagStart),
+        map(template_expr, XmlFragment::Expr),
+        map(template_var, XmlFragment::Var),
+        map(is_not("$<"), XmlFragment::Text),
+    ))(input)
+}
+
+fn xml_fragment_in_opening_tag<Cmd>(input: &str) -> IResult<&str, XmlFragment<Cmd>> {
+    preceded(
+        whitespace.opt(),
+        alt((
+            map(tag("/>"), XmlFragment::OpeningTagEnd),
+            map(tag(">"), XmlFragment::OpeningTagEnd),
+            map(attr, XmlFragment::Attr),
+        )),
     )(input)
 }
 
-fn element_end(input: &str) -> IResult<&str, &str> {
-    prefixed(tag("</"), word.trim(char('>')))(input)
+#[must_use = "use the `finish` method to properly handle a potential parsing error"]
+pub struct ShrimpleParser<'locator, 'input, Cmd> {
+    locator: &'locator Locator<'input>,
+    input: &'input str,
+    parsing_attrs: bool,
+    error: Result,
+    _cmd: PhantomData<Cmd>,
 }
 
-fn xml_fragment(src: &str) -> IResult<&str, XmlFragment> {
-    alt((
-        map(element_end,   XmlFragment::ElementEnd),
-        map(element_start, XmlFragment::ElementStart),
-        map(template_expr, XmlFragment::Expr),
-        map(template_var,  XmlFragment::Var),
-        map(is_not("$<"),  XmlFragment::Text),
-    ))
-    .parse(src)
+impl<'locator, 'input, Cmd: Copy> Iterator for ShrimpleParser<'locator, 'input, Cmd> {
+    type Item = XmlFragment<'input, Cmd>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let &mut Self { locator, input, parsing_attrs, ref error, .. } = self;
+
+        if error.is_err() {
+            return None;
+        }
+
+        let res =
+            if parsing_attrs { xml_fragment_in_opening_tag(input) } else { xml_fragment(input) };
+        match res {
+            Ok((input, res)) => {
+                self.input = input;
+                self.parsing_attrs = matches!((parsing_attrs, res), |(
+                    true,
+                    XmlFragment::Attr(_) | XmlFragment::Text(_),
+                )| (
+                    false,
+                    XmlFragment::OpeningTagStart(_)
+                ));
+                Some(res)
+            }
+            Err(nom::Err::Error(nom::error::Error { input: "", .. })) => {
+                // to preserve the address
+                self.input = &input[input.len()..];
+                None
+            }
+            Err(e) => {
+                self.error = Err(locator.wrap_nom_error(e));
+                None
+            }
+        }
+    }
 }
 
-pub fn parse_file<'src>(name: &Path, src: &'src str) -> Result<Vec<XmlFragment<'src>>, impl Error> {
-    use nom::Err::{Error as Errór, Incomplete, Failure};
-    match many1(xml_fragment).parse(src) {
-        Ok((_, res)) => Ok(res),
-        Err(Incomplete(_)) => unreachable!("the parser isn't streaming"),
-        Err(Errór(e) | Failure(e)) => Err(ErrorWithSource::from_nom_error(name, src, e)),
+impl<'locator, 'input, Cmd> ShrimpleParser<'locator, 'input, Cmd> {
+    pub fn new(input: &'input str, locator: &'locator Locator<'input>) -> Self {
+        Self { input, locator, parsing_attrs: false, _cmd: PhantomData, error: Ok(()) }
+    }
+
+    pub fn locator(&self) -> &'locator Locator<'input> {
+        self.locator
+    }
+
+    /// returns
+    pub fn finish(self) -> Result {
+        self.error
     }
 }

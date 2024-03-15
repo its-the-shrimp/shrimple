@@ -1,30 +1,32 @@
-$(EEEE)
 <$ref $SHRIMP="/shrimp-alpha.png" />
-<$define $SHRIMP_SIZE=100 />
-<$defineElement name=BODY acceptsChildren $title="The Shrimp">
+<$lua>SHRIMP_SIZE = 100</$lua>
+<$template name=BODY acceptsChildren $TITLE="The Shrimp">
     <!DOCTYPE html>
     <html>
         <head>
-            <link rel=stylesheet href=$(xref("index.css")) />
-            <title><$title /></title>
+            <link rel=stylesheet href=index.css />
+            <title>$TITLE</title>
         </head>
         <body>
             <svg class=bg width=$SHRIMP_SIZE height=100%>
                 <pattern
                     id=shrimp
-                    width=$SHRIMP_SIZE height="$(SHRIMP_SIZE 2 *)"
+                    width=$SHRIMP_SIZE height="$(SHRIMP_SIZE * 2)"
                     patternUnits=userSpaceOnUse
                 >
                     <image
                         href=$SHRIMP
                         width=$SHRIMP_SIZE height=$SHRIMP_SIZE
-                        transform="rotate(-30 $(SHRIMP_SIZE 2 /) $(SHRIMP_SIZE 2 /))"
+                        transform="rotate(-30 $(SHRIMP_SIZE / 2) $(SHRIMP_SIZE / 2))"
                     />
                     <image
                         href=$SHRIMP
                         y=$SHRIMP_SIZE
                         width=$SHRIMP_SIZE height=$SHRIMP_SIZE
-                        transform="rotate(30 $(SHRIMP_SIZE 2 /) $(SHRIMP_SIZE 2 / SHRIMP_SIZE +))"
+                        transform="rotate(
+                            30 $(SHRIMP_SIZE / 2)
+                            $(SHRIMP_SIZE / 2 + SHRIMP_SIZE) $(SHRIMP_SIZE / 2)
+                        )"
                     />
                 </pattern>
                 <rect width=100% height=100% fill=url(#shrimp) />
@@ -32,7 +34,7 @@ $(EEEE)
             <svg class="bg pin-right" width=$SHRIMP_SIZE height=100%>
                 <pattern
                     id=shrimp
-                    width=$SHRIMP_SIZE height="$(SHRIMP_SIZE 2 *)"
+                    width=$SHRIMP_SIZE height="$(SHRIMP_SIZE * 2)"
                     patternUnits=userSpaceOnUse
                 >
                     <image
@@ -54,14 +56,14 @@ $(EEEE)
             </div>
         </body>
     </html>
-</$define>
+</$template>
 
 <$BODY>
     <div class="underlined title">The Shrimp</div>
-    <p>Hi, I'm Tim "The Shrimp" Kurdov, a self-taught programmer based in Lisbon, Portugal</p>
-    <$foreach $POST in dir=posts>
+    <p>Hi, I'm Tim "The Shrimp" Kurdov</p>
+    <$foreach $POST in dir="posts">
         <div class=post>
-            <a href=$(xref(POST))>Post 0</a>
+            <a href=$POST>Post $index</a>
         </div>
     </$foreach>
 </$BODY>

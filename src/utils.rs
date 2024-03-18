@@ -1,7 +1,5 @@
-use std::borrow::Cow;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::{RangeFrom, RangeTo};
-
 use nom::character::complete::{char, satisfy};
 use nom::combinator::{cut, opt, peek, recognize};
 use nom::error::{Error as NomError, ErrorKind as NomErrorKind, ParseError};
@@ -86,18 +84,6 @@ pub fn surrounded<I, Prefix, O, Postfix, E: ParseError<I>>(
     postfix: impl Parser<I, Postfix, E>,
 ) -> impl FnMut(I) -> IResult<I, O, E> {
     delimited(first, cut(main), cut(postfix))
-}
-
-pub fn cow_into<'data, T, U>(src: Cow<'data, T>) -> Cow<'data, U>
-where
-    T: AsRef<U> + ToOwned + 'data + ?Sized,
-    U: ToOwned + 'data + ?Sized,
-    T::Owned: Into<U::Owned>,
-{
-    match src {
-        Cow::Borrowed(r) => Cow::Borrowed(r.as_ref()),
-        Cow::Owned(o) => Cow::Owned(o.into()),
-    }
 }
 
 /// Exists to compare/print strings as if they had an additional char `P` before them, without

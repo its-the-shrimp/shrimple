@@ -8,4 +8,3 @@ nom = "7"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.9", features = ["lua54"] }
-itertools = "0.12"

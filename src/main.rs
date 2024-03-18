@@ -1,5 +1,3 @@
-#![recursion_limit = "512"]
-
 mod error;
 mod evaluator;
 mod parser;
@@ -24,12 +22,16 @@ fn main() -> Result {
     let contents = cli
         .files
         .into_iter()
-        .map(|f| anyhow::Ok((read_to_string(&f)?, f)))
+        .map(|f| read_to_string(&f).map(|c| (c, f)))
         .collect::<Result<Vec<_>, _>>()?;
     for (contents, filename) in &contents {
-        let err_ctx = Locator::new(contents, filename);
+        let err_ctx = Locator::new(contents, filename)?;
         evaluator.eval(contents, &mut dst, &err_ctx)?;
         println!("{}:\n{}", filename.display(), dst)
+    }
+    println!("associated files:");
+    for r in evaluator.refs() {
+        println!("{}", r.display())
     }
     Ok(())
 }

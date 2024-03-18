@@ -12,7 +12,7 @@ use nom::{
     IResult, Parser,
 };
 use std::{
-    fmt::{self, Debug, Display, Formatter},
+    fmt::{self, Debug, Display, Formatter, Write},
     marker::PhantomData,
     ptr::null,
 };
@@ -81,8 +81,12 @@ impl<Cmd: Display> Display for XmlFragment<'_, Cmd> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::OpeningTagStart(name) => write!(f, "<{}", name),
-            Self::Attr(attr) => Display::fmt(attr, f),
-            Self::OpeningTagEnd(s) => Display::fmt(s, f),
+            Self::Attr(attr) => write!(f, " {attr}"),
+            Self::OpeningTagEnd(s) => if s.starts_with('/') {
+                f.write_str(" />")
+            } else {
+                f.write_char('>')
+            }
             Self::ClosingTag(name) => write!(f, "</{}>", name),
             Self::Var(name) => write!(f, "${}", name),
             Self::Expr(expr) => write!(f, "$({})", expr),
@@ -206,13 +210,10 @@ impl<'locator, 'input, Cmd: Copy> Iterator for ShrimpleParser<'locator, 'input, 
         match res {
             Ok((input, res)) => {
                 self.input = input;
-                self.parsing_attrs = matches!((parsing_attrs, res), |(
-                    true,
-                    XmlFragment::Attr(_) | XmlFragment::Text(_),
-                )| (
-                    false,
-                    XmlFragment::OpeningTagStart(_)
-                ));
+                self.parsing_attrs = matches!(
+                    res,
+                    XmlFragment::OpeningTagStart(_) | XmlFragment::Attr(_)
+                );
                 Some(res)
             }
             Err(nom::Err::Error(nom::error::Error { input: "", .. })) => {

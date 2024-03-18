@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use anyhow::{anyhow, Context, Result};
 use nom::Needed;
 use std::path::{Path, PathBuf};
 
@@ -13,8 +13,8 @@ pub struct Locator<'ctx> {
 
 impl<'ctx> Locator<'ctx> {
     /// `filename` must be absolute or relative to the current directory
-    pub fn new(src: &'ctx str, filename: &'ctx Path) -> Self {
-        Self { src, filename, dir: filename.parent().unwrap_or(Path::new("/")) }
+    pub fn new(src: &'ctx str, filename: &'ctx Path) -> Result<Self> {
+        Ok(Self { src, filename, dir: filename.parent().context("empty filename provided")? })
     }
 
     /// the return values are [line, column]
@@ -39,7 +39,18 @@ impl<'ctx> Locator<'ctx> {
     }
 
     pub fn locate_path(&self, path: impl AsRef<Path>) -> PathBuf {
-        self.dir.join(path)
+        let path = path.as_ref();
+        if !path.starts_with(self.dir) {
+            return self.dir.join(path)
+        }
+        path.to_owned()
+    }
+
+    /// Returns `path` relative to the path of the locator, or an error if `path` isn't related to
+    /// it.
+    pub fn as_relative<'path>(&self, path: &'path Path) -> Result<&'path Path> {
+        path.strip_prefix(self.dir)
+            .with_context(|| format!("{path:?} isn't relative to the directory"))
     }
 
     /// `desc` should be a nominal clause, i.e. `parsing`, `template expansion`, etc.

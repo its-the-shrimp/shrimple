@@ -1,6 +1,6 @@
 use crate::{
     file_ref::FileRepr,
-    utils::{group, prefixed, surrounded, whitespace, ParserExt, Result},
+    utils::{first, group, prefixed, surrounded, whitespace, ParserExt, Result},
 };
 use nom::{
     branch::alt,
@@ -249,4 +249,8 @@ impl<Cmd> ShrimpleParser<Cmd> {
     pub fn finish(&mut self) -> Result {
         replace(&mut self.error, Ok(()))
     }
+}
+
+pub fn url_scheme(url: &str) -> Option<&str> {
+    url.split_once(':').map(first).filter(|s| !s.contains('/'))
 }

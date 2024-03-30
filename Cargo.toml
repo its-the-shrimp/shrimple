@@ -8,3 +8,12 @@ nom = "7"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.9", features = ["lua54"] }
+
+[lints.clippy]
+single_char_lifetime_names = "warn"
+deref_by_slicing = "warn"
+derive_partial_eq_without_eq = "warn"
+expect_used = "warn"
+unwrap_used = "warn"
+explicit_iter_loop = "warn"
+explicit_into_iter_loop = "warn"

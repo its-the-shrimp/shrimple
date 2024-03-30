@@ -61,6 +61,10 @@ impl FileRepr {
         })
     }
 
+    pub fn is_raw(&self) -> bool {
+        matches!(self.state, FileReprState::Raw)
+    }
+
     pub fn src(&self) -> Option<&'static str> {
         match &self.state {
             FileReprState::Raw => None,

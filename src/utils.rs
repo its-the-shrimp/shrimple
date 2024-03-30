@@ -23,7 +23,7 @@ pub trait ParserExt<I, O>: Sized + Parser<I, O, NomError<I>> {
 
     /// equialent to `.and(next).map(|(prev, _new)| prev)`
     fn trim<O2>(self, other: impl Parser<I, O2, NomError<I>>) -> impl Parser<I, O, NomError<I>> {
-        self.and(other).map(|(prev, _)| prev)
+        self.and(other).map(first)
     }
 
     /// turns a recoverable error into a success value with `None` as the output
@@ -140,4 +140,16 @@ impl<T> OptionExt<T> for Option<T> {
     fn try_map<U, E>(self, f: impl FnOnce(T) -> Result<U, E>) -> Result<Option<U>, E> {
         self.map(f).transpose()
     }
+}
+
+pub fn first<T1, T2>(x: (T1, T2)) -> T1 {
+    x.0
+}
+
+pub unsafe fn assume_static<T>(x: &T) -> &'static T {
+    transmute(x)
+}
+
+pub unsafe fn assume_static_mut<T>(x: &mut T) -> &'static mut T {
+    transmute(x)
 }

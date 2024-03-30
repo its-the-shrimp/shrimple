@@ -1,10 +1,10 @@
 use crate::{
-    error::Locator,
+    file_ref::FileRepr,
     utils::{group, prefixed, surrounded, whitespace, ParserExt, Result},
 };
 use nom::{
     branch::alt,
-    bytes::complete::{is_not, tag},
+    bytes::complete::{is_not, tag, take_until1},
     character::complete::{char, satisfy},
     combinator::map,
     multi::{many0_count, many1_count},
@@ -14,6 +14,7 @@ use nom::{
 use std::{
     fmt::{self, Debug, Display, Formatter, Write},
     marker::PhantomData,
+    mem::replace,
     ptr::null,
 };
 
@@ -31,7 +32,7 @@ pub enum AttrValue<'src> {
 }
 
 impl Display for AttrValue<'_> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             Self::None => Ok(()),
             Self::Var(name) => write!(f, "${name}"),
@@ -48,7 +49,7 @@ pub struct Attr<'src> {
 }
 
 impl Display for Attr<'_> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         if matches!(self.value, AttrValue::None) {
             Display::fmt(self.name, f)
         } else {
@@ -78,14 +79,16 @@ pub enum XmlFragment<'src, Cmd = ()> {
 }
 
 impl<Cmd: Display> Display for XmlFragment<'_, Cmd> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             Self::OpeningTagStart(name) => write!(f, "<{}", name),
             Self::Attr(attr) => write!(f, " {attr}"),
-            Self::OpeningTagEnd(s) => if s.starts_with('/') {
-                f.write_str(" />")
-            } else {
-                f.write_char('>')
+            Self::OpeningTagEnd(s) => {
+                if s.starts_with('/') {
+                    f.write_str(" />")
+                } else {
+                    f.write_char('>')
+                }
             }
             Self::ClosingTag(name) => write!(f, "</{}>", name),
             Self::Var(name) => write!(f, "${}", name),
@@ -161,12 +164,17 @@ fn opening_tag_start(input: &str) -> IResult<&str, &str> {
     prefixed(char('<'), word)(input)
 }
 
+fn comment(input: &str) -> IResult<&str, &str> {
+    prefixed(tag("<!--"), take_until1("-->"))(input)
+}
+
 fn closing_tag(input: &str) -> IResult<&str, &str> {
     surrounded(tag("</"), word, char('>'))(input)
 }
 
 fn xml_fragment<Cmd>(input: &str) -> IResult<&str, XmlFragment<Cmd>> {
     alt((
+        map(comment, XmlFragment::Text),
         map(closing_tag, XmlFragment::ClosingTag),
         map(opening_tag_start, XmlFragment::OpeningTagStart),
         map(template_expr, XmlFragment::Expr),
@@ -187,59 +195,58 @@ fn xml_fragment_in_opening_tag<Cmd>(input: &str) -> IResult<&str, XmlFragment<Cm
 }
 
 #[must_use = "use the `finish` method to properly handle a potential parsing error"]
-pub struct ShrimpleParser<'locator, 'input, Cmd> {
-    locator: &'locator Locator<'input>,
-    input: &'input str,
+pub struct ShrimpleParser<Cmd> {
+    file: FileRepr,
+    input: &'static str,
     parsing_attrs: bool,
     error: Result,
     _cmd: PhantomData<Cmd>,
 }
 
-impl<'locator, 'input, Cmd: Copy> Iterator for ShrimpleParser<'locator, 'input, Cmd> {
-    type Item = XmlFragment<'input, Cmd>;
+impl<Cmd: Copy> Iterator for ShrimpleParser<Cmd> {
+    type Item = XmlFragment<'static, Cmd>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let &mut Self { locator, input, parsing_attrs, ref error, .. } = self;
-
-        if error.is_err() {
+        if self.error.is_err() {
             return None;
         }
 
-        let res =
-            if parsing_attrs { xml_fragment_in_opening_tag(input) } else { xml_fragment(input) };
+        let res = if self.parsing_attrs {
+            xml_fragment_in_opening_tag(self.input)
+        } else {
+            xml_fragment(self.input)
+        };
         match res {
             Ok((input, res)) => {
                 self.input = input;
-                self.parsing_attrs = matches!(
-                    res,
-                    XmlFragment::OpeningTagStart(_) | XmlFragment::Attr(_)
-                );
+                self.parsing_attrs =
+                    matches!(res, XmlFragment::OpeningTagStart(_) | XmlFragment::Attr(_));
                 Some(res)
             }
-            Err(nom::Err::Error(nom::error::Error { input: "", .. })) => {
+            Err(nom::Err::Error(nom::error::Error { input: input @ "", .. })) => {
                 // to preserve the address
-                self.input = &input[input.len()..];
+                self.input = input;
                 None
             }
             Err(e) => {
-                self.error = Err(locator.wrap_nom_error(e));
+                self.error = Err(self.file.wrap_nom_error(e));
                 None
             }
         }
     }
 }
 
-impl<'locator, 'input, Cmd> ShrimpleParser<'locator, 'input, Cmd> {
-    pub fn new(input: &'input str, locator: &'locator Locator<'input>) -> Self {
-        Self { input, locator, parsing_attrs: false, _cmd: PhantomData, error: Ok(()) }
+impl<Cmd> ShrimpleParser<Cmd> {
+    pub fn new(input: &'static str, file: FileRepr) -> Self {
+        Self { input, file, parsing_attrs: false, _cmd: PhantomData, error: Ok(()) }
     }
 
-    pub fn locator(&self) -> &'locator Locator<'input> {
-        self.locator
+    pub fn file(&self) -> &FileRepr {
+        &self.file
     }
 
     /// returns
-    pub fn finish(self) -> Result {
-        self.error
+    pub fn finish(&mut self) -> Result {
+        replace(&mut self.error, Ok(()))
     }
 }

@@ -1,5 +1,3 @@
-use std::fmt::{self, Debug, Display, Formatter};
-use std::ops::{RangeFrom, RangeTo};
 use nom::character::complete::{char, satisfy};
 use nom::combinator::{cut, opt, peek, recognize};
 use nom::error::{Error as NomError, ErrorKind as NomErrorKind, ParseError};
@@ -7,6 +5,10 @@ use nom::multi::many1_count;
 use nom::sequence::{delimited, preceded};
 use nom::{AsChar, IResult, InputIter, InputLength};
 use nom::{Offset, Parser, Slice};
+use std::ffi::OsStr;
+use std::fmt::{self, Debug, Display, Formatter};
+use std::mem::transmute;
+use std::ops::{RangeFrom, RangeTo};
 
 pub type Result<T = (), E = anyhow::Error> = std::result::Result<T, E>;
 
@@ -113,4 +115,29 @@ impl<const P: char, T: Display> Display for Prefixed<P, T> {
 
 pub fn default<T: Default>() -> T {
     T::default()
+}
+
+pub const fn os_str(x: &str) -> &OsStr {
+    unsafe { transmute(x) }
+}
+
+pub trait VecExt<T> {
+    fn push_and_get(&mut self, elem: T) -> &mut T;
+}
+
+impl<T> VecExt<T> for Vec<T> {
+    fn push_and_get(&mut self, elem: T) -> &mut T {
+        self.push(elem);
+        unsafe { self.last_mut().unwrap_unchecked() }
+    }
+}
+
+pub trait OptionExt<T> {
+    fn try_map<U, E>(self, f: impl FnOnce(T) -> Result<U, E>) -> Result<Option<U>, E>;
+}
+
+impl<T> OptionExt<T> for Option<T> {
+    fn try_map<U, E>(self, f: impl FnOnce(T) -> Result<U, E>) -> Result<Option<U>, E> {
+        self.map(f).transpose()
+    }
 }

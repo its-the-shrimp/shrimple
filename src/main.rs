@@ -1,37 +1,29 @@
-mod error;
 mod evaluator;
+mod file_ref;
 mod parser;
 mod utils;
 
-use crate::error::Locator;
-use crate::evaluator::Evaluator;
 use crate::utils::Result;
+use anyhow::Context;
 use clap::Parser;
-use std::{fs::read_to_string, path::PathBuf};
+use evaluator::eval;
+use std::{env::set_current_dir, path::PathBuf};
 
 #[derive(Parser)]
 #[command(name = "shrimple", author, version, about)]
-struct Cli {
-    files: Vec<PathBuf>,
+struct Args {
+    /// the output directory for all the files
+    #[arg(long, short = 'o')]
+    output: PathBuf,
+
+    file: PathBuf,
 }
 
 fn main() -> Result {
-    let cli = Cli::parse();
-    let mut evaluator = Evaluator::default();
-    let mut dst = String::new();
-    let contents = cli
-        .files
-        .into_iter()
-        .map(|f| read_to_string(&f).map(|c| (c, f)))
-        .collect::<Result<Vec<_>, _>>()?;
-    for (contents, filename) in &contents {
-        let err_ctx = Locator::new(contents, filename)?;
-        evaluator.eval(contents, &mut dst, &err_ctx)?;
-        println!("{}:\n{}", filename.display(), dst)
-    }
-    println!("associated files:");
-    for r in evaluator.refs() {
-        println!("{}", r.display())
-    }
-    Ok(())
+    let args = Args::parse();
+    let output = args.output.canonicalize().context("failed to locate the output root")?;
+    let abs_file = args.file.canonicalize().context("failed to locate the source file")?;
+    let root = abs_file.parent().context("invalid source file")?;
+    set_current_dir(root)?;
+    eval(&abs_file, root, output)
 }

@@ -8,6 +8,10 @@ const PROCESSED_FORMATS: [&OsStr; 2] = [os_str("css"), os_str("html")];
 
 /// the return values are [line, column]
 fn ptr_to_loc(src: &str, ptr: *const u8) -> [usize; 2] {
+    if src.is_empty() {
+        return [0, 0]
+    }
+
     let offset =
         (ptr as usize).checked_sub(src.as_ptr() as usize).map_or(0, |x| x.min(src.len() - 1));
     let [mut line, mut column] = [1, 0];

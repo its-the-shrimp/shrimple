@@ -8,6 +8,7 @@ use std::io;
 use std::mem::take;
 use std::path::Path;
 use std::ptr::null;
+use DoubleEndedIterator as Reversible;
 
 use crate::file_ref::FileRepr;
 use crate::parser::{url_scheme, Attr, AttrValue, ShrimpleParser};
@@ -111,10 +112,14 @@ impl<'files> EvalCtx<'files> {
     fn enqueue<T>(&mut self, tokens: T)
     where
         T: IntoIterator<Item = XmlFragment>,
-        T::IntoIter: DoubleEndedIterator,
+        T::IntoIter: Reversible,
     {
         self.queue.extend(tokens.into_iter().rev())
     }
+    // TODO: uncomment in 1.79.0
+    //fn enqueue(&mut self, tokens: impl IntoIterator<Item = XmlFragment, IntoIter: Reversible>) {
+    //    self.queue.extend(tokens.into_iter().rev())
+    //}
 
     fn wrap_error(error: anyhow::Error, r: FileRepr, at: Option<XmlFragment>) -> anyhow::Error {
         r.wrap(error, at.map_or(null(), |f| f.as_src_ptr()), "template expansion")

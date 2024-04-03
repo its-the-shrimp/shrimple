@@ -2,6 +2,12 @@
 name = "shrimple"
 version = "0.1.0"
 edition = "2021"
+description = "Minimal CLI for static site generation, supercharged with Lua"
+authors = ["Tim Kurdov <tim.kurdov@gmail.com>"]
+repository = "https://github.com/schvv31n/shrimple"
+license = "MIT"
+keywords = ["template-engine"]
+categories = ["template-engine", "compilers", "command-line-interface", "web-programming"]
 
 [dependencies]
 nom = "7"

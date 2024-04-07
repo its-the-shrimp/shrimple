@@ -1,5 +1,9 @@
 ![It's as shrimple as that](https://raw.githubusercontent.com/schvv31n/shrimple/master/static/shrimple.jpg)
 # The shrimple static site generator
+## Installation
+```console
+cargo install shrimple
+```
 ## Features
 ### 1. Keep it shrimple
 No external configuration needed: you have HTML, you have `shrimple`, you call it, and get a site ready to be deployed.

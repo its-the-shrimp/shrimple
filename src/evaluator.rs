@@ -10,7 +10,7 @@ use std::path::Path;
 use std::ptr::null;
 use DoubleEndedIterator as Reversible;
 
-use crate::file_ref::FileRepr;
+use crate::file_ref::{ptr_to_loc, FileRepr};
 use crate::parser::{url_scheme, Attr, AttrValue, ShrimpleParser};
 use crate::utils::{
     assume_static, assume_static_mut, default, OptionExt, Prefixed, Result, VecExt,
@@ -169,7 +169,6 @@ struct IterCtx {
 #[derive(Default)]
 pub struct Evaluator {
     templates: Vec<Template>,
-    // TODO: move to TokenQueue
     lua_ctx: Lua,
 }
 
@@ -254,7 +253,7 @@ impl Evaluator {
             }
             f(frag);
         }
-        bail!("expected `</{tag_name}`, instead got EOF")
+        bail!("expected `</{tag_name}>`, instead got EOF")
     }
 
     fn collect_inner_xml<'tag>(tag_name: impl StrLike<'tag>, ctx: &mut EvalCtx) -> Result<String> {
@@ -273,30 +272,39 @@ impl Evaluator {
     }
 
     fn handle_ref_template(&mut self, ctx: &mut EvalCtx) -> Result {
-        let Attr { name, value } = match ctx.next() {
-            Some(XmlFragment::Attr(attr)) => attr,
-            Some(XmlFragment::OpeningTagEnd(_)) => bail!("`$ref` expects exactly 1 attribute"),
-            None => bail!("expected attributes or `/>`, instead got EOF"),
-            _ => bail!("unexpected input"),
+        let mut attr = None;
+        let mut needs_processing = None;
+        let Some(Attr { name, value }) = (loop {
+            match ctx.next() {
+                None => {
+                    bail!("expected `<ref_name>=<ref_path>`, `raw`, `processed`, instead got EOF")
+                }
+                Some(XmlFragment::Attr(new_attr)) => match new_attr.name {
+                    "raw" | "processed" if needs_processing.is_some() => {
+                        bail!("can't specify more than 1 processing mode")
+                    }
+                    "raw" | "processed" if new_attr.has_value() => {
+                        bail!("processing mode specifier must not have a value, remove `=...`")
+                    }
+                    "raw" => needs_processing = Some(false),
+                    "processed" => needs_processing = Some(true),
+                    _ if attr.is_none() => {
+                        bail!("can't define more than 1 reference in a single `$ref` element")
+                    }
+                    _ => attr = Some(new_attr),
+                },
+                Some(XmlFragment::OpeningTagEnd(_)) => break attr,
+                _ => bail!("invalid input, expected `<ref_name>=<ref_path>`, `raw`, `processed`"),
+            }
+        }) else {
+            bail!("neither variable name nor path provided")
         };
         let Some(name) = name.strip_prefix('$') else {
             bail!("`$ref` only accepts a variable name prefixed with `$`, instead got {name:?}")
         };
-        let path: Cow<'_, str> = match value {
-            AttrValue::None => bail!("no file path provided"),
-            AttrValue::Var(s) => self.get_lua_var(s)?.into(),
-            AttrValue::Expr(s) => self.eval_lua(s, *ctx.file())?.into(),
-            AttrValue::Text(s) => s.into(),
-        };
+        let path = self.eval_attr_value(&value, ctx)?.context("no file path provided")?;
         self.set_lua_var(name, &path)?;
-        ctx.add_file(FileRepr::new(&*path, Some(false))?)?;
-        match ctx.next() {
-            Some(XmlFragment::OpeningTagEnd("/>")) => Ok(()),
-            Some(XmlFragment::Attr(_)) => bail!("can't define more than 1 reference in a `$ref`"),
-            Some(XmlFragment::OpeningTagEnd(">")) => bail!("`$ref` can't have children"),
-            None => bail!("expected `/>`, instead got EOF"),
-            _ => bail!("unexpected input"),
-        }
+        ctx.add_file(FileRepr::new(&*path, needs_processing)?).map(drop)
     }
 
     fn handle_lua_template(&mut self, ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
@@ -627,7 +635,15 @@ impl Evaluator {
             }
         }
 
-        ensure!(tag_stack.is_empty(), "unclosed elements present: {tag_stack:?}");
+        if !tag_stack.is_empty() {
+            let mut err_msg = "unclosed elements present:\n".to_owned();
+            let src = ctx.parser.file().src().context("internal bug: no source code found")?;
+            for tag in tag_stack {
+                let [line, col] = ptr_to_loc(src, tag.as_ptr().wrapping_sub(1));
+                writeln!(err_msg, "\t{tag:?} at {line}:{col}")?;
+            }
+            bail!(err_msg)
+        }
         Ok(())
     }
 }

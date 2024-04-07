@@ -50,11 +50,17 @@ pub struct Attr<'src> {
 
 impl Display for Attr<'_> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        if matches!(self.value, AttrValue::None) {
+        if !self.has_value() {
             Display::fmt(self.name, f)
         } else {
             write!(f, "{}={}", self.name, self.value)
         }
+    }
+}
+
+impl Attr<'_> {
+    pub fn has_value(&self) -> bool {
+        !matches!(self.value, AttrValue::None)
     }
 }
 

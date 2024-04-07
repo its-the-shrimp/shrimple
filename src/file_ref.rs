@@ -6,10 +6,10 @@ use std::{ffi::OsStr, fs::read_to_string, path::Path};
 /// file formats that are processed by default as template files
 const PROCESSED_FORMATS: [&OsStr; 2] = [os_str("css"), os_str("html")];
 
-/// the return values are [line, column]
-fn ptr_to_loc(src: &str, ptr: *const u8) -> [usize; 2] {
+/// the return values are `[line, column]`
+pub fn ptr_to_loc(src: &str, ptr: *const u8) -> [usize; 2] {
     if src.is_empty() {
-        return [0, 0]
+        return [0, 0];
     }
 
     let offset =

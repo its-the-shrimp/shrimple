@@ -2,11 +2,12 @@ mod evaluator;
 mod file_ref;
 mod parser;
 mod utils;
+mod mime;
 
 use crate::utils::Result;
 use anyhow::Context;
 use clap::Parser;
-use evaluator::eval;
+use evaluator::Evaluator;
 use std::{env::set_current_dir, path::PathBuf};
 
 #[derive(Parser)]
@@ -25,5 +26,5 @@ fn main() -> Result {
     let abs_file = args.file.canonicalize().context("failed to locate the source file")?;
     let root = abs_file.parent().context("invalid source file")?;
     set_current_dir(root)?;
-    eval(&abs_file, root, output)
+    Evaluator::default().eval(&abs_file, root, output)
 }

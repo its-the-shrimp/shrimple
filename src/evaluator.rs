@@ -1,19 +1,22 @@
 use anyhow::{bail, ensure, Context};
 use mlua::Value::Nil;
 use mlua::{FromLua, Integer, Lua, Value};
+use ureq::Agent;
 use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::fmt::{self, Display, Formatter, Write};
-use std::fs::{create_dir_all, hard_link, read_dir, remove_file, write, ReadDir};
+use std::fs::{create_dir, create_dir_all, hard_link, read_dir, remove_file, write, ReadDir};
 use std::io;
 use std::mem::take;
 use std::path::Path;
 use std::ptr::null;
 use DoubleEndedIterator as Reversible;
 
-use crate::file_ref::{ptr_to_loc, FileRepr};
+use crate::file_ref::{ptr_to_loc, FileRepr, FileReprState};
+use crate::mime::remote_file_ext;
 use crate::parser::{url_scheme, Attr, AttrValue, ShrimpleParser};
 use crate::utils::{
-    assume_static, assume_static_mut, default, OptionExt, Prefixed, Result, VecExt,
+    assume_static, assume_static_mut, default, os_str, OptionExt, Prefixed, Result, ShortStr
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,20 +45,18 @@ impl<'src, T: PartialEq<&'src str> + Display> StrLike<'src> for T {}
 // trait StrLike<'src> = PartialEq<&'src str> + Display;
 
 /// The parser + a queue for tokens to be fetched before progressing the parser
-struct EvalCtx<'files> {
+struct EvalCtx {
     parser: ShrimpleParser<EvalCmd>,
     queue: Vec<XmlFragment>,
     /// Last fragment fetched from the queue
     last: Option<XmlFragment>,
-    /// Already registered files
-    files: &'files mut Vec<FileRepr>,
     /// A stack of currently expanded user-defined templates
     expansions: Vec<Expansion>,
     /// A stack of the contents of the currently expanded `$foreach` templates
     iterators: Vec<IterCtx>,
 }
 
-impl<'files> Iterator for EvalCtx<'files> {
+impl Iterator for EvalCtx {
     type Item = XmlFragment;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -67,11 +68,10 @@ impl<'files> Iterator for EvalCtx<'files> {
     }
 }
 
-impl<'files> EvalCtx<'files> {
+impl EvalCtx {
     fn process<R>(
         src: &'static str,
         r: FileRepr,
-        files: &'files mut Vec<FileRepr>,
         f: impl FnOnce(&mut Self) -> Result<R>,
     ) -> Result<R> {
         let mut ctx = Self {
@@ -80,7 +80,6 @@ impl<'files> EvalCtx<'files> {
             expansions: vec![],
             iterators: vec![],
             last: None,
-            files,
         };
         let res = f(&mut ctx);
         ctx.parser.finish().and(res.map_err(|e| Self::wrap_error(e, *ctx.file(), ctx.last)))
@@ -97,7 +96,7 @@ impl<'files> EvalCtx<'files> {
         src: &'static str,
         f: impl FnOnce(&mut EvalCtx, &mut String) -> Result,
     ) -> Result<Cow<'static, str>> {
-        EvalCtx::process(src, *self.file(), self.files, |ctx| {
+        EvalCtx::process(src, *self.file(), |ctx| {
             match ctx.parser.next() {
                 None => return Ok(src.into()),
                 Some(XmlFragment::Text(t)) if t.len() == src.len() => return Ok(src.into()),
@@ -128,18 +127,6 @@ impl<'files> EvalCtx<'files> {
     fn end_expansion(&mut self) -> Result {
         self.expansions.pop().map(drop).context("internal bug: no template expansion to end")
     }
-
-    fn add_file(&mut self, r: FileRepr) -> Result<&FileRepr> {
-        Ok(if let Some(id) = self.files.iter_mut().position(|r2| *r2.path == *r.path) {
-            let existing = &mut self.files[id]; // Calms the crab, do not touch.
-            if existing.state < r.state {
-                existing.state = r.state;
-            }
-            existing
-        } else {
-            self.files.push_and_get(r)
-        })
-    }
 }
 
 struct TemplateAttr {
@@ -166,10 +153,24 @@ struct IterCtx {
     iter: ReadDir,
 }
 
-#[derive(Default)]
 pub struct Evaluator {
     templates: Vec<Template>,
     lua_ctx: Lua,
+    processed_exts: Vec<&'static OsStr>,
+    http_client: Agent,
+    files: Vec<FileRepr>,
+}
+
+impl Default for Evaluator {
+    fn default() -> Self {
+        Self {
+            http_client: Agent::new(),
+            templates: default(),
+            lua_ctx: default(),
+            processed_exts: vec![os_str("html"), os_str("css")],
+            files: vec![],
+        }
+    }
 }
 
 /// For all `handle*template` functions:
@@ -227,9 +228,26 @@ impl Evaluator {
             AttrValue::Var(var) => Some(self.get_lua_var(var)?.into()),
             AttrValue::Expr(code) => Some(self.eval_lua(code, *ctx.file())?.into()),
             AttrValue::Text(text) => {
-                let res: Cow<'static, str> = ctx.format_str(text, |q, dst| self.eval(q, dst))?;
+                let res: Cow<'static, str> = ctx.format_str(
+                    text,
+                    |q, dst| self.eval_file(q, dst)
+                )?;
                 Some(res)
             }
+        })
+    }
+
+    fn add_file(&mut self, r: FileRepr) -> Result<usize> {
+        Ok(if let Some(id) = self.files.iter_mut().position(|r2| *r2.path == *r.path) {
+            let existing = &mut self.files[id]; // Calms the crab, do not touch.
+            if existing.state == FileReprState::Raw && r.state != FileReprState::Raw {
+                existing.state = r.state;
+            }
+            id
+        } else {
+            let id = self.files.len();
+            self.files.push(r);
+            id
         })
     }
 
@@ -271,6 +289,19 @@ impl Evaluator {
         Ok(res)
     }
 
+    fn collect_inner_xml_fragments_and_inspect<'tag>(
+        tag_name: impl StrLike<'tag>,
+        ctx: &mut EvalCtx,
+        mut f: impl FnMut(&XmlFragment),
+    ) -> Result<Vec<XmlFragment>> {
+        let mut res = vec![];
+        Self::for_each_inner_xml(tag_name, ctx, |frag| {
+            f(&frag);
+            res.push(frag);
+        })?;
+        Ok(res)
+    }
+
     fn handle_ref_template(&mut self, ctx: &mut EvalCtx) -> Result {
         let mut attr = None;
         let mut needs_processing = None;
@@ -304,7 +335,8 @@ impl Evaluator {
         };
         let path = self.eval_attr_value(&value, ctx)?.context("no file path provided")?;
         self.set_lua_var(name, &path)?;
-        ctx.add_file(FileRepr::new(&*path, needs_processing)?).map(drop)
+        self.add_file(FileRepr::new(&*path, needs_processing, &self.processed_exts)?)?;
+        Ok(())
     }
 
     fn handle_lua_template(&mut self, ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
@@ -323,7 +355,7 @@ impl Evaluator {
         let mut accepts_children = false;
         let mut name: Option<&str> = None;
         let mut attrs = vec![];
-        loop {
+        let children = loop {
             match ctx.next() {
                 None => bail!("expected attributes, `>` or `/>`, instead got EOF"),
 
@@ -347,19 +379,21 @@ impl Evaluator {
                     attrs.push(TemplateAttr { name, default: self.eval_attr_value(&value, ctx)? })
                 }
 
-                Some(XmlFragment::OpeningTagEnd("/>")) => bail!("`$template` must have children"),
+                Some(XmlFragment::OpeningTagEnd("/>")) => break default(),
 
-                Some(XmlFragment::OpeningTagEnd(">")) => break,
+                Some(XmlFragment::OpeningTagEnd(">")) => {
+                    break Self::collect_inner_xml_fragments("$template", ctx)?.into()
+                }
 
                 _ => bail!("unexpected input"),
             }
-        }
+        };
 
         self.templates.push(Template {
-            name: name.context("no template name provided")?,
             accepts_children,
+            children,
+            name: name.context("no template name provided")?,
             attrs: attrs.into(),
-            children: Self::collect_inner_xml_fragments("$template", ctx)?.into(),
         });
         Ok(())
     }
@@ -382,7 +416,7 @@ impl Evaluator {
             bail!("`${name}` doesn't accept children so `$children` can't be used in it")
         };
         // Safety: per `IterCtx::enqueue`, `ctx.expansions` won't be changed
-        ctx.enqueue(unsafe { assume_static(children) }.iter().copied());
+        ctx.enqueue(unsafe {assume_static(children)}.iter().copied());
         Ok(())
     }
 
@@ -417,6 +451,24 @@ impl Evaluator {
         };
         ctx.iterators.push(iter_ctx);
         ctx.enqueue([XmlFragment::Internal(EvalCmd::AdvanceIter)]);
+        Ok(())
+    }
+
+    fn handle_registerprocessedext_template(&mut self, ctx: &mut EvalCtx) -> Result {
+        let ext = match ctx.next() {
+            None => bail!("expected file extension, instead got EOF"),
+            Some(XmlFragment::Attr(Attr { name, value: AttrValue::None })) => name,
+            Some(XmlFragment::Attr(_)) => {
+                bail!("the argument must be the file extension without the dot, remove `=...`")
+            }
+            _ => bail!("expected file extension")
+        };
+        if ext.starts_with('.') {
+            bail!("the file extension must not start with a dot")
+        }
+        ensure!(ctx.next() == Some(XmlFragment::OpeningTagEnd("/>")), "expected `/>`");
+
+        self.processed_exts.push(os_str(ext));
         Ok(())
     }
 
@@ -481,14 +533,23 @@ impl Evaluator {
                         Expansion { index, children: accepts_children.then(default) }
                     } else {
                         ensure!(accepts_children, "`${name}` doesn't accept children");
+                        let mut can_recurse = false;
+                        let children = Self::collect_inner_xml_fragments_and_inspect(
+                            Prefixed::<'$', _>(name),
+                            ctx,
+                            |f| can_recurse = match *f {
+                                XmlFragment::OpeningTagStart("$children") => true,
+                                XmlFragment::OpeningTagEnd("$template") => false,
+                                _ => return,
+                            }
+                        )?;
+                        if can_recurse {
+                            bail!("using `<$children>` in template children is disallowed \
+                                   as it'd lead to infinite recursion")
+                        }
                         Expansion {
                             index,
-                            children: Self::collect_inner_xml_fragments(
-                                Prefixed::<'$', _>(name),
-                                ctx,
-                            )?
-                            .into_boxed_slice()
-                            .into(),
+                            children: children.into_boxed_slice().into(),
                         }
                     };
                     ctx.expansions.push(expansion);
@@ -508,7 +569,7 @@ impl Evaluator {
     }
 
     /// `EMPTY` is defined per the HTML spec
-    fn _handle_element<const EMPTY: bool>(
+    fn _handle_element<const IS_VOID: bool>(
         &mut self,
         name: &'static str,
         ctx: &mut EvalCtx,
@@ -518,29 +579,72 @@ impl Evaluator {
         tag_stack: &mut Vec<&'static str>,
     ) -> Result {
         write!(dst, "<{name}")?;
+        // TODO: add a flag for processing cached remote assets
+        let mut cached = false;
         while let Some(frag) = ctx.next() {
             match frag {
                 XmlFragment::Attr(Attr { name: attr_name, value }) => {
-                    write!(dst, " {attr_name}")?;
                     let value = self.eval_attr_value(&value, ctx)?;
-                    if let Some(value) = value {
-                        // TODO: implement remote asset caching
-                        if ref_attrs.contains(&attr_name) && url_scheme(&value).is_none() {
-                            ctx.add_file(FileRepr::new(&*value, None)?)?;
+                    let Some(value) = value else {
+                        match attr_name {
+                            "$cached" => cached = true,
+                            x => ensure!(!x.starts_with('$'), "unknown special attribute: {x:?}"),
+                        }
+                        if ref_attrs.contains(&attr_name) {
+                            bail!("`{name}` element's `{attr_name}` attribute must have a value")
+                        }
+                        continue;
+                    };
+                    write!(dst, " {attr_name}")?;
+
+                    match (ref_attrs.contains(&attr_name), take(&mut cached)) {
+                        (true, true) => match url_scheme(&value) { // ref attr, cached
+                            Some("http") | Some("https") => {
+                                let response = self.http_client.get(&value).call()
+                                    .with_context(|| format!("failed to fetch {value:?}"))?;
+                                let ext = remote_file_ext(&response)
+                                    .with_context(|| format!("unable to infer the file type \
+                                                              of the URL {value:?}"))?
+                                    .to_owned();
+                                let mut content = vec![];
+                                response.into_reader().read_to_end(&mut content)?;
+                                let id = self.add_file(
+                                    FileRepr::new_cached(value, content.leak(), ext)
+                                )?;
+                                write!(dst, "=\"/cached/{id}{ext}\"")?
+                            }
+                            Some(s) => {
+                                bail!("unable to cache, unknown URI scheme: {s:?}\n\
+                                       \tthe full URI is {value:?}")
+                            }
+                            None => {
+                                bail!("`$cached` can only be applied to remote assets\n\
+                                       \tthe full URI is {value:?}")
+                            }
+                        }
+
+                        (true, false) => { // ref attr, not cached
+                            self.add_file(FileRepr::new(&*value, None, &self.processed_exts)?)?;
                             write!(dst, "=\"/{value}\"")?
-                        } else {
+                        }
+
+                        (false, true) => { // not ref attr, cached
+                            bail!("`$cached` can only be applied to a reference attribute\n\
+                                   \tmore on reference attributes here: \
+                                   https://github.com/schvv31n/shrimple/wiki/Assets")
+                        }
+
+                        (false, false) => { // not ref attr, not cached
+                            if attr_name.starts_with('$') {
+                                bail!("unknown special attribute: {attr_name:?}")
+                            }
                             write!(dst, "=\"{value}\"")?
                         }
-                    } else if ref_attrs.contains(&attr_name) {
-                        bail!("`{name}` element's `{attr_name}` attribute must have a value")
                     }
                 }
 
                 XmlFragment::OpeningTagEnd(t) => {
-                    if t.starts_with('/') {
-                        dst.write_str([" />", ">"][EMPTY as usize])?;
-                        return Ok(());
-                    } else if EMPTY {
+                    if IS_VOID && !t.starts_with('/') {
                         bail!("element `{name}` must be self-closing")
                     } else {
                         tag_stack.push(name);
@@ -567,6 +671,7 @@ impl Evaluator {
         self._handle_element::<false>(name, ctx, dst, ref_attrs, tag_stack)
     }
 
+    /// https://developer.mozilla.org/en-US/docs/Glossary/Void_element
     fn handle_void_element(
         &mut self,
         name: &'static str,
@@ -579,7 +684,7 @@ impl Evaluator {
     }
 
     #[rustfmt::skip]
-    fn eval(&mut self, ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
+    fn eval_file(&mut self, ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
         let mut tag_stack: Vec<&str> = vec![];
         while let Some(frag) = ctx.next() {
             match frag {
@@ -589,10 +694,11 @@ impl Evaluator {
                     "$template" => self.handle_template_template(ctx)?,
                     "$children" => self.handle_children_template(ctx)?,
                     "$foreach" => self.handle_foreach_template(ctx)?,
+                    "$registerProcessedExt" => self.handle_registerprocessedext_template(ctx)?,
                     "a"     |
-                    "image" |
-                    "link" => self.handle_element(name, ctx, dst, &["href"], &mut tag_stack)?,
-                    // https://developer.mozilla.org/en-US/docs/Glossary/Void_element
+                    "image" => self.handle_element(name, ctx, dst, &["href"], &mut tag_stack)?,
+                    "link" => self.handle_void_element(name, ctx, dst, &["href"])?,
+                    "img" => self.handle_void_element(name, ctx, dst, &["src"])?,
                     "!DOCTYPE" |
                     "area"     |
                     "base"     |
@@ -600,7 +706,6 @@ impl Evaluator {
                     "col"      |
                     "embed"    |
                     "hr"       |
-                    "img"      |
                     "input"    |
                     "meta"     |
                     "param"    |
@@ -646,38 +751,66 @@ impl Evaluator {
         }
         Ok(())
     }
-}
 
-pub fn eval(src: impl AsRef<Path>, root: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result {
-    let src_root = root.as_ref();
-    let dst_root = dst.as_ref();
-    let mut files = vec![FileRepr::new(src, Some(true))?];
-    let mut evaluator = Evaluator::default();
-    let mut dst = String::new();
+    pub fn eval(
+        mut self,
+        src: impl AsRef<Path>,
+        root: impl AsRef<Path>,
+        dst: impl AsRef<Path>,
+    ) -> Result {
+        let src_root = root.as_ref();
+        let mut dst_root = dst.as_ref().to_owned();
+        self.add_file(FileRepr::new_template(src)?)?;
+        let mut dst = String::new();
 
-    while let Some((src, file)) =
-        files.iter_mut().find_map(|x| x.src_for_processing().map(|s| (s, *x)))
-    {
-        dst.clear();
-        EvalCtx::process(src, file, &mut files, |ctx| evaluator.eval(ctx, &mut dst))
-            .with_context(|| format!("failed to evaluate templates in {:?}", file.path))?;
-        let dst_path = dst_root.join(file.path.strip_prefix(src_root)?);
-        dst_path.parent().try_map(create_dir_all)?;
-        write(&dst_path, &dst).with_context(|| format!("failed to write to {dst_path:?}"))?;
-    }
-
-    for FileRepr { path: src, .. } in files.into_iter().filter(FileRepr::is_raw) {
-        let dst = dst_root.join(src.strip_prefix(src_root)?);
-        dst.parent().try_map(create_dir_all)?;
-        match hard_link(src, &dst) {
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                remove_file(&dst).with_context(|| format!("failed to remove {dst:?}"))?;
-                hard_link(src, &dst)
-            }
-            x => x,
+        while let Some((src, file)) =
+            self.files.iter_mut().find_map(|x| x.src_for_processing().map(|s| (s, *x)))
+        {
+            dst.clear();
+            EvalCtx::process(src, file, |ctx| self.eval_file(ctx, &mut dst))
+                .with_context(|| format!("failed to evaluate templates in {:?}", file.path))?;
+            let dst_path = dst_root.join(file.path.strip_prefix(src_root)?);
+            dst_path.parent().try_map(create_dir_all)?;
+            write(&dst_path, &dst).with_context(|| format!("failed to write to {dst_path:?}"))?;
         }
-        .with_context(|| format!("failed to created a hard link from {src:?} to {dst:?}"))?;
-    }
 
-    Ok(())
+        for (id, FileRepr { path: src, state }) in self.files.iter().enumerate() {
+            match state {
+                FileReprState::Raw => {
+                    let dst = dst_root.join(src.strip_prefix(src_root)?);
+                    dst.parent().try_map(create_dir_all)?;
+                    if let Err(err) = hard_link(src, &dst) {
+                        if err.kind() == io::ErrorKind::AlreadyExists {
+                            remove_file(&dst).with_context(|| format!("failed to remove {dst:?}"))?;
+                            hard_link(src, &dst)?
+                        } else {
+                            bail!("failed to create a link from {src:?} to {dst:?}:\n\t{err}")
+                        }
+                    }
+                }
+
+                FileReprState::Cached{content, ext} => {
+                    dst_root.push("cached");
+                    match create_dir(&dst_root) {
+                        Err(err) if err.kind() != io::ErrorKind::AlreadyExists =>
+                            bail!("failed to create a directory {dst_root:?}: {err}"),
+                        _ => {},
+                    }
+                    let mut num = ShortStr::default();
+                    write!(&mut num, "{id}")?;
+                    dst_root.push(num.as_str());
+                    if let Some(ext) = ext.as_str().get(1..) {
+                        dst_root.set_extension(ext);
+                    }
+                    write(&dst_root, content)?;
+                    dst_root.pop();
+                    dst_root.pop();
+                }
+
+                FileReprState::Template(_) | FileReprState::Processed(_) => {}
+            }
+        }
+
+        Ok(())
+    }
 }

@@ -1,10 +1,7 @@
-use crate::utils::{os_str, OptionExt};
+use crate::utils::{OptionExt, ShortStr};
 use anyhow::{anyhow, Context, Result};
 use nom::Needed;
 use std::{ffi::OsStr, fs::read_to_string, path::Path};
-
-/// file formats that are processed by default as template files
-const PROCESSED_FORMATS: [&OsStr; 2] = [os_str("css"), os_str("html")];
 
 /// the return values are `[line, column]`
 pub fn ptr_to_loc(src: &str, ptr: *const u8) -> [usize; 2] {
@@ -26,22 +23,48 @@ pub fn ptr_to_loc(src: &str, ptr: *const u8) -> [usize; 2] {
     [line, column]
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // the string stored in the state is the source code
 pub enum FileReprState {
     Raw,
+    Cached{content: &'static [u8], ext: ShortStr},
     Template(&'static str),
     Processed(&'static str),
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub struct FileRepr {
+    /// if `state` is `Cached`, this is the URL from which the file was cached
     pub path: &'static Path,
     pub state: FileReprState,
 }
 
 impl FileRepr {
-    pub fn new(path: impl AsRef<Path>, needs_processing: Option<bool>) -> Result<Self> {
+    pub fn new_template(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let path: &'static Path = Box::leak(
+            path.canonicalize()
+                .with_context(|| format!("failed to locate {path:?}"))?
+                .into_boxed_path(),
+        );
+        Ok(Self {
+            path,
+            state: FileReprState::Template(read_to_string(path)?.leak()),
+        })
+    }
+
+    pub fn new_cached(url: impl AsRef<str>, content: &'static [u8], ext: ShortStr) -> Self {
+        Self {
+            path: Path::new(url.as_ref().to_owned().leak()),
+            state: FileReprState::Cached{content, ext}
+        }
+    }
+
+    pub fn new(
+        path: impl AsRef<Path>,
+        needs_processing: Option<bool>,
+        processed_exts: &[&OsStr],
+    ) -> Result<Self> {
         let path = path.as_ref();
         Ok(Self {
             path: Box::leak(
@@ -58,20 +81,16 @@ impl FileRepr {
                 Some(false) => FileReprState::Raw,
                 None => path
                     .extension()
-                    .filter(|ext| PROCESSED_FORMATS.contains(ext))
+                    .filter(|ext| processed_exts.contains(ext))
                     .try_map(|_| read_to_string(path))?
                     .map_or(FileReprState::Raw, |src| FileReprState::Template(src.leak())),
             },
         })
     }
 
-    pub fn is_raw(&self) -> bool {
-        matches!(self.state, FileReprState::Raw)
-    }
-
     pub fn src(&self) -> Option<&'static str> {
         match &self.state {
-            FileReprState::Raw => None,
+            FileReprState::Raw | FileReprState::Cached{..} => None,
             FileReprState::Template(src) | FileReprState::Processed(src) => Some(src),
         }
     }

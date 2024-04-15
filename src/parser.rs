@@ -258,5 +258,5 @@ impl<Cmd> ShrimpleParser<Cmd> {
 }
 
 pub fn url_scheme(url: &str) -> Option<&str> {
-    url.split_once(':').map(first).filter(|s| !s.contains('/'))
+    url.split_once(':').map(first)
 }

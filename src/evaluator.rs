@@ -12,9 +12,10 @@ use std::path::Path;
 use std::ptr::null;
 use DoubleEndedIterator as Reversible;
 
-use crate::file_ref::{ptr_to_loc, FileRepr, FileReprState};
+use crate::asset::{ptr_to_loc, Asset, AssetState};
 use crate::mime::remote_file_ext;
 use crate::parser::{url_scheme, Attr, AttrValue, ShrimpleParser};
+use crate::short_str;
 use crate::utils::{
     assume_static, assume_static_mut, default, os_str, OptionExt, Prefixed, Result, ShortStr
 };
@@ -71,7 +72,7 @@ impl Iterator for EvalCtx {
 impl EvalCtx {
     fn process<R>(
         src: &'static str,
-        r: FileRepr,
+        r: Asset,
         f: impl FnOnce(&mut Self) -> Result<R>,
     ) -> Result<R> {
         let mut ctx = Self {
@@ -85,7 +86,7 @@ impl EvalCtx {
         ctx.parser.finish().and(res.map_err(|e| Self::wrap_error(e, *ctx.file(), ctx.last)))
     }
 
-    fn file(&self) -> &FileRepr {
+    fn file(&self) -> &Asset {
         self.parser.file()
     }
 
@@ -120,7 +121,7 @@ impl EvalCtx {
     //    self.queue.extend(tokens.into_iter().rev())
     //}
 
-    fn wrap_error(error: anyhow::Error, r: FileRepr, at: Option<XmlFragment>) -> anyhow::Error {
+    fn wrap_error(error: anyhow::Error, r: Asset, at: Option<XmlFragment>) -> anyhow::Error {
         r.wrap(error, at.map_or(null(), |f| f.as_src_ptr()), "template expansion")
     }
 
@@ -158,7 +159,7 @@ pub struct Evaluator {
     lua_ctx: Lua,
     processed_exts: Vec<&'static OsStr>,
     http_client: Agent,
-    files: Vec<FileRepr>,
+    assets: Vec<Asset>,
 }
 
 impl Default for Evaluator {
@@ -168,7 +169,7 @@ impl Default for Evaluator {
             templates: default(),
             lua_ctx: default(),
             processed_exts: vec![os_str("html"), os_str("css")],
-            files: vec![],
+            assets: vec![],
         }
     }
 }
@@ -204,7 +205,7 @@ impl Evaluator {
         Ok(())
     }
 
-    fn eval_lua(&self, code: &str, file: FileRepr) -> Result<String> {
+    fn eval_lua(&self, code: &str, file: Asset) -> Result<String> {
         Ok(match self.lua_ctx.load(code).set_name(file.locate(code.as_ptr())).eval()? {
             Value::Nil => String::new(),
             Value::Number(n) => {
@@ -237,18 +238,47 @@ impl Evaluator {
         })
     }
 
-    fn add_file(&mut self, r: FileRepr) -> Result<usize> {
-        Ok(if let Some(id) = self.files.iter_mut().position(|r2| *r2.path == *r.path) {
-            let existing = &mut self.files[id]; // Calms the crab, do not touch.
-            if existing.state == FileReprState::Raw && r.state != FileReprState::Raw {
+    fn add_asset(&mut self, r: Asset) -> Result<usize> {
+        Ok(if let Some(id) = self.assets.iter_mut().position(|r2| *r2.path == *r.path) {
+            let existing = &mut self.assets[id]; // Calms the crab, do not touch.
+            if existing.state == AssetState::Raw && r.state != AssetState::Raw {
                 existing.state = r.state;
             }
             id
         } else {
-            let id = self.files.len();
-            self.files.push(r);
+            let id = self.assets.len();
+            self.assets.push(r);
             id
         })
+    }
+
+    /// the return values are:
+    /// (the index of the asset, the file extension of the asset)
+    fn cache_remote_asset(&mut self, url: &str) -> Result<(usize, ShortStr)> {
+        match url_scheme(url) {
+            Some("http") | Some("https") => {
+                let response = self.http_client.get(url).call()
+                    .with_context(|| format!("failed to fetch {url:?}"))?;
+                let ext = remote_file_ext(&response)
+                    .with_context(|| format!("unable to infer the file type \
+                                              of the URL {url:?}"))?
+                    .to_owned();
+                let mut content = vec![];
+                response.into_reader().read_to_end(&mut content)?;
+                let id = self.add_asset(
+                    Asset::new_cached(url, content.leak(), ext)
+                )?;
+                Ok((id, ext))
+            }
+            Some(s) => {
+                bail!("unable to cache, unknown URI scheme: {s:?}\n\
+                       \tthe full URI is {url:?}")
+            }
+            None => {
+                bail!("`$cached` can only be applied to remote assets\n\
+                       \tthe full URI is {url:?}")
+            }
+        }
     }
 
     fn for_each_inner_xml<'tag_name>(
@@ -304,6 +334,7 @@ impl Evaluator {
 
     fn handle_ref_template(&mut self, ctx: &mut EvalCtx) -> Result {
         let mut attr = None;
+        let mut remote_cached = false;
         let mut needs_processing = None;
         let Some(Attr { name, value }) = (loop {
             match ctx.next() {
@@ -317,6 +348,8 @@ impl Evaluator {
                     "raw" | "processed" if new_attr.has_value() => {
                         bail!("processing mode specifier must not have a value, remove `=...`")
                     }
+                    "cached" if remote_cached => bail!("`cached` can only be provided once"),
+                    "cached" => remote_cached = true,
                     "raw" => needs_processing = Some(false),
                     "processed" => needs_processing = Some(true),
                     _ if attr.is_none() => {
@@ -330,12 +363,21 @@ impl Evaluator {
         }) else {
             bail!("neither variable name nor path provided")
         };
+
         let Some(name) = name.strip_prefix('$') else {
             bail!("`$ref` only accepts a variable name prefixed with `$`, instead got {name:?}")
         };
+
         let path = self.eval_attr_value(&value, ctx)?.context("no file path provided")?;
-        self.set_lua_var(name, &path)?;
-        self.add_file(FileRepr::new(&*path, needs_processing, &self.processed_exts)?)?;
+        if remote_cached {
+            let (id, ext) = self.cache_remote_asset(&path)?;
+            let mut buf = short_str!("/cached/", len: 64);
+            write!(&mut buf, "{id}{ext}")?;
+            self.set_lua_var(name, buf.as_str());
+        } else {
+            self.set_lua_var(name, &path)?;
+            self.add_asset(Asset::new(&*path, needs_processing, &self.processed_exts)?)?;
+        }
         Ok(())
     }
 
@@ -400,7 +442,6 @@ impl Evaluator {
 
     /// paste children passed to the invocation of the currently expanded template
     fn handle_children_template(&mut self, ctx: &mut EvalCtx) -> Result {
-        // TODO: can't use `$children` in the children provided to a template
         match ctx.next() {
             Some(XmlFragment::OpeningTagEnd("/>")) => (),
             Some(XmlFragment::OpeningTagEnd(">")) => bail!("`$children` doesn't accept children"),
@@ -537,7 +578,7 @@ impl Evaluator {
                         let children = Self::collect_inner_xml_fragments_and_inspect(
                             Prefixed::<'$', _>(name),
                             ctx,
-                            |f| can_recurse = match *f {
+                            |f| can_recurse = match f {
                                 XmlFragment::OpeningTagStart("$children") => true,
                                 XmlFragment::OpeningTagEnd("$template") => false,
                                 _ => return,
@@ -579,7 +620,6 @@ impl Evaluator {
         tag_stack: &mut Vec<&'static str>,
     ) -> Result {
         write!(dst, "<{name}")?;
-        // TODO: add a flag for processing cached remote assets
         let mut cached = false;
         while let Some(frag) = ctx.next() {
             match frag {
@@ -608,8 +648,8 @@ impl Evaluator {
                                     .to_owned();
                                 let mut content = vec![];
                                 response.into_reader().read_to_end(&mut content)?;
-                                let id = self.add_file(
-                                    FileRepr::new_cached(value, content.leak(), ext)
+                                let id = self.add_asset(
+                                    Asset::new_cached(value, content.leak(), ext)
                                 )?;
                                 write!(dst, "=\"/cached/{id}{ext}\"")?
                             }
@@ -624,7 +664,7 @@ impl Evaluator {
                         }
 
                         (true, false) => { // ref attr, not cached
-                            self.add_file(FileRepr::new(&*value, None, &self.processed_exts)?)?;
+                            self.add_asset(Asset::new(&*value, None, &self.processed_exts)?)?;
                             write!(dst, "=\"/{value}\"")?
                         }
 
@@ -760,11 +800,11 @@ impl Evaluator {
     ) -> Result {
         let src_root = root.as_ref();
         let mut dst_root = dst.as_ref().to_owned();
-        self.add_file(FileRepr::new_template(src)?)?;
+        self.add_asset(Asset::new_template(src)?)?;
         let mut dst = String::new();
 
         while let Some((src, file)) =
-            self.files.iter_mut().find_map(|x| x.src_for_processing().map(|s| (s, *x)))
+            self.assets.iter_mut().find_map(|x| x.src_for_processing().map(|s| (s, *x)))
         {
             dst.clear();
             EvalCtx::process(src, file, |ctx| self.eval_file(ctx, &mut dst))
@@ -774,9 +814,9 @@ impl Evaluator {
             write(&dst_path, &dst).with_context(|| format!("failed to write to {dst_path:?}"))?;
         }
 
-        for (id, FileRepr { path: src, state }) in self.files.iter().enumerate() {
+        for (id, Asset { path: src, state }) in self.assets.iter().enumerate() {
             match state {
-                FileReprState::Raw => {
+                AssetState::Raw => {
                     let dst = dst_root.join(src.strip_prefix(src_root)?);
                     dst.parent().try_map(create_dir_all)?;
                     if let Err(err) = hard_link(src, &dst) {
@@ -789,7 +829,7 @@ impl Evaluator {
                     }
                 }
 
-                FileReprState::Cached{content, ext} => {
+                AssetState::Cached{content, ext} => {
                     dst_root.push("cached");
                     match create_dir(&dst_root) {
                         Err(err) if err.kind() != io::ErrorKind::AlreadyExists =>
@@ -807,7 +847,7 @@ impl Evaluator {
                     dst_root.pop();
                 }
 
-                FileReprState::Template(_) | FileReprState::Processed(_) => {}
+                AssetState::Template(_) | AssetState::Processed(_) => {}
             }
         }
 

@@ -147,63 +147,61 @@ pub unsafe fn assume_static_mut<T>(x: &mut T) -> &'static mut T {
     transmute(x)
 }
 
-/// A by-value string of at most 15 bytes, making the struct the same size as a `&str`
 #[derive(Clone, Copy)]
-pub struct ShortStr {
-    // TODO: think of ways to remove this by implementing the struct as a C-like string
-    // safety invariant: 
+pub struct ShortStr<const CAP: usize = 15> {
+    // safety invariant: `self.len <= CAP`
     len: u8,
-    buf: [u8; Self::CAP],
+    buf: [u8; CAP],
 }
 
-impl Debug for ShortStr {
+impl<const CAP: usize> Debug for ShortStr<CAP> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         Debug::fmt(self.as_str(), f)
     }
 }
 
-impl Display for ShortStr {
+impl<const CAP: usize> Display for ShortStr<CAP> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         Display::fmt(self.as_str(), f)
     }
 }
 
-impl PartialEq for ShortStr {
+impl<const CAP: usize> PartialEq for ShortStr<CAP> {
     fn eq(&self, other: &Self) -> bool {
         self.as_str().eq(other.as_str())
     }
 }
 
-impl Eq for ShortStr {}
+impl<const CAP: usize> Eq for ShortStr<CAP> {}
 
-impl PartialOrd for ShortStr {
+impl<const CAP: usize> PartialOrd for ShortStr<CAP> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for ShortStr {
+impl<const CAP: usize> Ord for ShortStr<CAP> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.as_str().cmp(other.as_str())
     }
 }
 
-impl AsRef<str> for ShortStr {
+impl<const CAP: usize> AsRef<str> for ShortStr<CAP> {
     #[inline(always)]
     fn as_ref(&self) -> &str {
         self.as_str()
     }
 }
 
-impl Default for ShortStr {
+impl<const CAP: usize> Default for ShortStr<CAP> {
     fn default() -> Self {
-        Self { len: 0, buf: [0; Self::CAP] }
+        Self { len: 0, buf: [0; CAP] }
     }
 }
 
-impl Write for ShortStr {
+impl<const CAP: usize> Write for ShortStr<CAP> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        if self.len() + s.len() > Self::CAP {
+        if self.len() + s.len() > CAP {
             return Err(fmt::Error);
         }
         unsafe {
@@ -226,16 +224,24 @@ macro_rules! short_str {
             RES
         }
     };
+
+    ($str:expr, len: $len:literal) => {
+        {
+            const RES: ShortStr<$len> = match ShortStr::<$len>::new($str) {
+                Some(x) => x,
+                None => panic!("constructing a short string"),
+            };
+            RES
+        }
+    };
 }
 
-impl ShortStr {
-    pub const CAP: usize = 15;
-
-    /// returns `None` if `src`'s length is over 15
+impl<const CAP: usize> ShortStr<CAP> {
+    /// returns `None` if `src`'s length is over `CAP`
     pub const fn new(src: &str) -> Option<Self> {
         let len = src.len();
-        if len > Self::CAP {return None}
-        let mut buf = [0; Self::CAP];
+        if CAP > u8::MAX as usize || len > CAP {return None}
+        let mut buf = [0; CAP];
         let mut i = 0;
         let mut ptr = src.as_ptr();
         while i < len {

@@ -25,7 +25,7 @@ pub fn ptr_to_loc(src: &str, ptr: *const u8) -> [usize; 2] {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // the string stored in the state is the source code
-pub enum FileReprState {
+pub enum AssetState {
     Raw,
     Cached{content: &'static [u8], ext: ShortStr},
     Template(&'static str),
@@ -33,13 +33,13 @@ pub enum FileReprState {
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
-pub struct FileRepr {
+pub struct Asset {
     /// if `state` is `Cached`, this is the URL from which the file was cached
     pub path: &'static Path,
-    pub state: FileReprState,
+    pub state: AssetState,
 }
 
-impl FileRepr {
+impl Asset {
     pub fn new_template(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let path: &'static Path = Box::leak(
@@ -49,14 +49,14 @@ impl FileRepr {
         );
         Ok(Self {
             path,
-            state: FileReprState::Template(read_to_string(path)?.leak()),
+            state: AssetState::Template(read_to_string(path)?.leak()),
         })
     }
 
     pub fn new_cached(url: impl AsRef<str>, content: &'static [u8], ext: ShortStr) -> Self {
         Self {
             path: Path::new(url.as_ref().to_owned().leak()),
-            state: FileReprState::Cached{content, ext}
+            state: AssetState::Cached{content, ext}
         }
     }
 
@@ -73,25 +73,25 @@ impl FileRepr {
                     .into_boxed_path(),
             ),
             state: match needs_processing {
-                Some(true) => FileReprState::Template(
+                Some(true) => AssetState::Template(
                     read_to_string(path)
                         .with_context(|| format!("failed to read contents of {path:?}"))?
                         .leak(),
                 ),
-                Some(false) => FileReprState::Raw,
+                Some(false) => AssetState::Raw,
                 None => path
                     .extension()
                     .filter(|ext| processed_exts.contains(ext))
                     .try_map(|_| read_to_string(path))?
-                    .map_or(FileReprState::Raw, |src| FileReprState::Template(src.leak())),
+                    .map_or(AssetState::Raw, |src| AssetState::Template(src.leak())),
             },
         })
     }
 
     pub fn src(&self) -> Option<&'static str> {
         match &self.state {
-            FileReprState::Raw | FileReprState::Cached{..} => None,
-            FileReprState::Template(src) | FileReprState::Processed(src) => Some(src),
+            AssetState::Raw | AssetState::Cached{..} => None,
+            AssetState::Template(src) | AssetState::Processed(src) => Some(src),
         }
     }
 
@@ -99,8 +99,8 @@ impl FileRepr {
     /// returns None
     pub fn src_for_processing(&mut self) -> Option<&'static str> {
         match self.state {
-            FileReprState::Template(src) => {
-                self.state = FileReprState::Processed(src);
+            AssetState::Template(src) => {
+                self.state = AssetState::Processed(src);
                 Some(src)
             }
             _ => None,

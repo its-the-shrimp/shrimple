@@ -1,5 +1,5 @@
 use crate::{
-    file_ref::FileRepr,
+    asset::Asset,
     utils::{first, group, prefixed, surrounded, whitespace, ParserExt, Result},
 };
 use nom::{
@@ -202,7 +202,7 @@ fn xml_fragment_in_opening_tag<Cmd>(input: &str) -> IResult<&str, XmlFragment<Cm
 
 #[must_use = "use the `finish` method to properly handle a potential parsing error"]
 pub struct ShrimpleParser<Cmd> {
-    file: FileRepr,
+    file: Asset,
     input: &'static str,
     parsing_attrs: bool,
     error: Result,
@@ -243,11 +243,11 @@ impl<Cmd: Copy> Iterator for ShrimpleParser<Cmd> {
 }
 
 impl<Cmd> ShrimpleParser<Cmd> {
-    pub fn new(input: &'static str, file: FileRepr) -> Self {
+    pub fn new(input: &'static str, file: Asset) -> Self {
         Self { input, file, parsing_attrs: false, _cmd: PhantomData, error: Ok(()) }
     }
 
-    pub fn file(&self) -> &FileRepr {
+    pub fn file(&self) -> &Asset {
         &self.file
     }
 

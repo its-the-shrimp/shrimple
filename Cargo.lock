@@ -389,8 +389,15 @@ dependencies = [
  "clap",
  "mlua",
  "nom",
+ "shrimple-localhost",
  "ureq",
 ]
+
+[[package]]
+name = "shrimple-localhost"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "616af460dc269cd12d7c2942a67d5a3836526a16f47c18a0a40ad766f8ae88d2"
 
 [[package]]
 name = "spin"

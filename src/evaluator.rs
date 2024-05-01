@@ -5,7 +5,7 @@ use ureq::Agent;
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::fmt::{self, Display, Formatter, Write};
-use std::fs::{create_dir, create_dir_all, hard_link, read_dir, remove_file, write, ReadDir};
+use std::fs::{create_dir, create_dir_all, read_dir, remove_file, write, ReadDir};
 use std::io;
 use std::mem::take;
 use std::path::Path;
@@ -17,7 +17,7 @@ use crate::mime::remote_file_ext;
 use crate::parser::{url_scheme, Attr, AttrValue, ShrimpleParser};
 use crate::short_str;
 use crate::utils::{
-    assume_static, assume_static_mut, default, os_str, OptionExt, Prefixed, Result, ShortStr
+    assume_static, assume_static_mut, default, os_str, soft_link, OptionExt, Prefixed, Result, ShortStr
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,7 +231,7 @@ impl Evaluator {
             AttrValue::Text(text) => {
                 let res: Cow<'static, str> = ctx.format_str(
                     text,
-                    |q, dst| self.eval_file(q, dst)
+                    |q, dst| self.eval(q, dst)
                 )?;
                 Some(res)
             }
@@ -239,8 +239,8 @@ impl Evaluator {
     }
 
     fn add_asset(&mut self, r: Asset) -> Result<usize> {
-        Ok(if let Some(id) = self.assets.iter_mut().position(|r2| *r2.path == *r.path) {
-            let existing = &mut self.assets[id]; // Calms the crab, do not touch.
+        Ok(if let Some(id) = self.assets.iter_mut().position(|r2| r2.path == r.path) {
+            let existing = &mut self.assets[id];
             if existing.state == AssetState::Raw && r.state != AssetState::Raw {
                 existing.state = r.state;
             }
@@ -373,7 +373,7 @@ impl Evaluator {
             let (id, ext) = self.cache_remote_asset(&path)?;
             let mut buf = short_str!("/cached/", len: 64);
             write!(&mut buf, "{id}{ext}")?;
-            self.set_lua_var(name, buf.as_str());
+            self.set_lua_var(name, buf.as_str())?;
         } else {
             self.set_lua_var(name, &path)?;
             self.add_asset(Asset::new(&*path, needs_processing, &self.processed_exts)?)?;
@@ -633,6 +633,7 @@ impl Evaluator {
                         if ref_attrs.contains(&attr_name) {
                             bail!("`{name}` element's `{attr_name}` attribute must have a value")
                         }
+                        write!(dst, " {attr_name}")?;
                         continue;
                     };
                     write!(dst, " {attr_name}")?;
@@ -684,13 +685,16 @@ impl Evaluator {
                 }
 
                 XmlFragment::OpeningTagEnd(t) => {
-                    if IS_VOID && !t.starts_with('/') {
-                        bail!("element `{name}` must be self-closing")
-                    } else {
-                        tag_stack.push(name);
-                        dst.write_char('>')?;
-                        return Ok(());
+                    match (IS_VOID, t.starts_with('/')) {
+                        (true, true) => dst.write_char('>')?,
+                        (true, false) => bail!("element {name} must be self-closing"),
+                        (false, true) => write!(dst, "></{name}>")?,
+                        (false, false) => {
+                            dst.write_char('>')?;
+                            tag_stack.push(name);
+                        }
                     }
+                    return Ok(())
                 }
 
                 _ => bail!("expected attributes, `>` or `/>`"),
@@ -724,7 +728,7 @@ impl Evaluator {
     }
 
     #[rustfmt::skip]
-    fn eval_file(&mut self, ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
+    fn eval(&mut self, ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
         let mut tag_stack: Vec<&str> = vec![];
         while let Some(frag) = ctx.next() {
             match frag {
@@ -739,7 +743,8 @@ impl Evaluator {
                     "image" => self.handle_element(name, ctx, dst, &["href"], &mut tag_stack)?,
                     "link" => self.handle_void_element(name, ctx, dst, &["href"])?,
                     "img" => self.handle_void_element(name, ctx, dst, &["src"])?,
-                    "!DOCTYPE" |
+                    "!DOCTYPE" => bail!("<!DOCTYPE> is inserted automatically & \
+                                         need not be specified explicitly"),
                     "area"     |
                     "base"     |
                     "br"       |
@@ -792,7 +797,14 @@ impl Evaluator {
         Ok(())
     }
 
-    pub fn eval(
+    fn eval_file(&mut self, ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
+        if ctx.file().path.extension() == Some(os_str("html")) {
+            dst.write_str("<!DOCTYPE html>\n")?;
+        }
+        self.eval(ctx, dst)
+    }
+
+    pub fn eval_all(
         mut self,
         src: impl AsRef<Path>,
         root: impl AsRef<Path>,
@@ -819,10 +831,10 @@ impl Evaluator {
                 AssetState::Raw => {
                     let dst = dst_root.join(src.strip_prefix(src_root)?);
                     dst.parent().try_map(create_dir_all)?;
-                    if let Err(err) = hard_link(src, &dst) {
+                    if let Err(err) = soft_link(src, &dst) {
                         if err.kind() == io::ErrorKind::AlreadyExists {
                             remove_file(&dst).with_context(|| format!("failed to remove {dst:?}"))?;
-                            hard_link(src, &dst)?
+                            soft_link(src, &dst)?
                         } else {
                             bail!("failed to create a link from {src:?} to {dst:?}:\n\t{err}")
                         }
@@ -836,7 +848,7 @@ impl Evaluator {
                             bail!("failed to create a directory {dst_root:?}: {err}"),
                         _ => {},
                     }
-                    let mut num = ShortStr::default();
+                    let mut num = ShortStr::<32>::default();
                     write!(&mut num, "{id}")?;
                     dst_root.push(num.as_str());
                     if let Some(ext) = ext.as_str().get(1..) {

@@ -13,6 +13,7 @@ use std::mem::transmute;
 use std::ops::{RangeFrom, RangeTo};
 use std::ptr::copy_nonoverlapping;
 use std::str::from_utf8_unchecked;
+use std::path::Path;
 
 pub type Result<T = (), E = anyhow::Error> = std::result::Result<T, E>;
 
@@ -262,4 +263,14 @@ impl<const CAP: usize> ShortStr<CAP> {
     pub const fn as_str(&self) -> &str {
         unsafe {from_utf8_unchecked(slice::from_raw_parts(self.buf.as_ptr(), self.len as usize))}
     }
+}
+
+#[cfg(windows)]
+pub fn soft_link(original: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io::Result<()> {
+    hard_link(original, link)
+}
+
+#[cfg(unix)]
+pub fn soft_link(original: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(original, link)
 }

@@ -15,6 +15,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.9", features = ["lua54"] }
 ureq = "2.9.6"
+shrimple-localhost = "3"
 
 [lints.clippy]
 single_char_lifetime_names = "warn"

@@ -6,7 +6,7 @@ use nom::{
     branch::alt,
     bytes::complete::{is_not, tag, take_until1},
     character::complete::{char, satisfy},
-    combinator::map,
+    combinator::{map, recognize},
     multi::{many0_count, many1_count},
     sequence::{delimited, preceded},
     IResult, Parser,
@@ -158,7 +158,7 @@ fn attr(input: &str) -> IResult<&str, Attr> {
 }
 
 fn template_var(input: &str) -> IResult<&str, &str> {
-    prefixed(prefix, many1_count(ident_char).recognize())(input)
+    prefixed(prefix, recognize(many1_count(ident_char)))(input)
 }
 
 fn template_expr(input: &str) -> IResult<&str, &str> {
@@ -171,7 +171,7 @@ fn opening_tag_start(input: &str) -> IResult<&str, &str> {
 }
 
 fn comment(input: &str) -> IResult<&str, &str> {
-    prefixed(tag("<!--"), take_until1("-->"))(input)
+    prefixed(tag("<!--"), take_until1("-->")).trim(tag("-->")).parse(input)
 }
 
 fn closing_tag(input: &str) -> IResult<&str, &str> {
@@ -179,8 +179,8 @@ fn closing_tag(input: &str) -> IResult<&str, &str> {
 }
 
 fn xml_fragment<Cmd>(input: &str) -> IResult<&str, XmlFragment<Cmd>> {
+    let (input, _) = many0_count(comment)(input)?;
     alt((
-        map(comment, XmlFragment::Text),
         map(closing_tag, XmlFragment::ClosingTag),
         map(opening_tag_start, XmlFragment::OpeningTagStart),
         map(template_expr, XmlFragment::Expr),

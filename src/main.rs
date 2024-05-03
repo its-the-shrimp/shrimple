@@ -8,7 +8,7 @@ use crate::utils::Result;
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use evaluator::Evaluator;
-use shrimple_localhost::{Server, ServerError};
+use shrimple_localhost::{Request, RequestResult, Server, ServerError};
 use std::{env::set_current_dir, path::PathBuf};
 
 #[derive(Parser)]
@@ -47,7 +47,7 @@ fn main() -> Result {
     let port = args.port.unwrap_or(Server::DEFAULT_PORT);
     let mut server = Server::new_at(&output, port)?;
     let mut last_mtime = root.metadata()?.modified()?;
-    println!("Local server with hot-reloading set-up at \"http://localhost:{port}\"");
+    println!("Local server with hot-reloading set-up at http://127.0.0.1:{port}");
     server.try_serve_with_callback(
         |_, _| {
             let mtime = root.metadata()?.modified()?;
@@ -58,7 +58,22 @@ fn main() -> Result {
             println!("Change detected, rebuilding website...");
             Evaluator::default().eval_all(&abs_file, root, &output)
         },
-        |addr, res| Ok(println!("Requested processed from {addr}, result: {res}")),
+        |addr, res| Ok(match res {
+            RequestResult::Ok(req) if req.client_cache_reused() => 
+                println!("{addr}:\n -> GET {}\n <- 304 Not Modified", req.path.display()),
+            RequestResult::Ok(req) => 
+                println!("{addr}:\n -> GET {}\n <- 200 OK", req.path.display()),
+            RequestResult::InvalidHttpMethod =>
+                println!("{addr}:\n -> <invalid HTTP method>\n <- 400 Bad Request"),
+            RequestResult::NoRequestedPath => 
+                println!("{addr}:\n -> <no requested path>\n <- 400 Bad Request"),
+            RequestResult::InvalidHttpVersion =>
+                println!("{addr}:\n -> <invalid HTTP version>\n <- 400 Bad Request"),
+            RequestResult::InvalidHeader => 
+                println!("{addr}:\n -> <invalid header(s)>\n <- 400 Bad Request"),
+            RequestResult::FileNotFound(path) =>
+                println!("{addr}:\n -> GET {}\n <- 404 Not Found", path.display()),
+        }),
     )
     .map(|r| match r {})
     .map_err(|err| match err {

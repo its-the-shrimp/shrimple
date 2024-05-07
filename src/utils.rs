@@ -1,7 +1,7 @@
 use nom::character::complete::{char, satisfy};
 use nom::combinator::{cut, opt, peek, recognize};
 use nom::error::{Error as NomError, ErrorKind as NomErrorKind, ParseError};
-use nom::multi::many1_count;
+use nom::multi::many0_count;
 use nom::sequence::{delimited, preceded};
 use nom::{AsChar, IResult, InputIter, InputLength};
 use nom::{Offset, Parser, Slice};
@@ -12,8 +12,9 @@ use std::fmt::{self, Debug, Display, Formatter, Write};
 use std::mem::transmute;
 use std::ops::{RangeFrom, RangeTo};
 use std::ptr::copy_nonoverlapping;
+use std::slice::from_raw_parts;
 use std::str::from_utf8_unchecked;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub type Result<T = (), E = anyhow::Error> = std::result::Result<T, E>;
 
@@ -54,7 +55,7 @@ where
     I: Slice<RangeTo<usize>> + Slice<RangeFrom<usize>> + InputIter + Clone + InputLength + Offset,
     <I as InputIter>::Item: AsChar,
 {
-    many1_count(satisfy(|c: char| c.is_ascii_whitespace())).recognize().parse(input)
+    many0_count(satisfy(|c: char| c.is_ascii_whitespace())).recognize().parse(input)
 }
 
 pub fn group(open: char, close: char) -> impl Fn(&str) -> IResult<&str, &str> {
@@ -136,6 +137,16 @@ impl<T> OptionExt<T> for Option<T> {
     }
 }
 
+pub trait PathBufExt {
+    fn leak(self) -> &'static Path;
+}
+
+impl PathBufExt for PathBuf {
+    fn leak(self) -> &'static Path {
+        Box::leak(self.into_boxed_path())
+    }
+}
+
 pub fn first<T1, T2>(x: (T1, T2)) -> T1 {
     x.0
 }
@@ -146,6 +157,11 @@ pub unsafe fn assume_static<T>(x: &T) -> &'static T {
 
 pub unsafe fn assume_static_mut<T>(x: &mut T) -> &'static mut T {
     transmute(x)
+}
+
+/// TODO: remove when [`std::str::from_raw_parts`] is stabilised
+pub const unsafe fn str_from_raw_parts<'str>(data: *const u8, len: usize) -> &'str str {
+    from_utf8_unchecked(from_raw_parts(data, len))
 }
 
 #[derive(Clone, Copy)]
@@ -267,7 +283,7 @@ impl<const CAP: usize> ShortStr<CAP> {
 
 #[cfg(windows)]
 pub fn soft_link(original: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io::Result<()> {
-    hard_link(original, link)
+    std::fs::hard_link(original, link)
 }
 
 #[cfg(unix)]

@@ -1,6 +1,5 @@
 use crate::{
-    asset::Asset,
-    utils::{first, group, prefixed, surrounded, whitespace, ParserExt, Result},
+    asset::Asset, escape_html::EscapeHtml, utils::{first, group, prefixed, str_from_raw_parts, surrounded, whitespace, ParserExt, Result}
 };
 use nom::{
     branch::alt,
@@ -8,14 +7,11 @@ use nom::{
     character::complete::{char, satisfy},
     combinator::{map, recognize},
     multi::{many0_count, many1_count},
-    sequence::{delimited, preceded},
+    sequence::delimited,
     IResult, Parser,
 };
 use std::{
-    fmt::{self, Debug, Display, Formatter, Write},
-    marker::PhantomData,
-    mem::replace,
-    ptr::null,
+    fmt::{self, Debug, Display, Formatter}, marker::PhantomData, mem::replace, ptr::null, 
 };
 
 #[derive(Debug, PartialEq, Eq, Default, Clone, Copy)]
@@ -33,34 +29,87 @@ pub enum AttrValue<'src> {
 
 impl Display for AttrValue<'_> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match self {
-            Self::None => Ok(()),
-            Self::Var(name) => write!(f, "${name}"),
-            Self::Expr(expr) => write!(f, "$({expr})"),
-            Self::Text(text) => Debug::fmt(text, f),
+        if f.alternate() {
+            match self {
+                Self::None => Ok(()),
+                Self::Var(name) => write!(f, "${}", EscapeHtml(name)),
+                Self::Expr(expr) => write!(f, "$({})", EscapeHtml(expr)),
+                Self::Text(text) => Debug::fmt(&EscapeHtml(text), f),
+            }
+        } else {
+            match self {
+                Self::None => Ok(()),
+                Self::Var(name) => write!(f, "${name}"),
+                Self::Expr(expr) => write!(f, "$({expr})"),
+                Self::Text(text) => Debug::fmt(text, f),
+            }
         }
     }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct Attr<'src> {
-    pub name: &'src str,
+    prefix_and_name: &'src str,
+    /// Safety: `self.name_start < self.prefix_and_name.len()`
+    name_start: usize,
     pub value: AttrValue<'src>,
 }
 
 impl Display for Attr<'_> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        if !self.has_value() {
-            Display::fmt(self.name, f)
+        if f.alternate() {
+            if !self.has_value() {
+                Display::fmt(&EscapeHtml(self.prefix_and_name), f)
+            } else {
+                write!(f, "{}={:#}", EscapeHtml(self.prefix_and_name), self.value)
+            }
+        } else if !self.has_value() {
+            Display::fmt(self.prefix_and_name, f)
         } else {
-            write!(f, "{}={}", self.name, self.value)
+            write!(f, "{}={}", self.prefix_and_name, self.value)
         }
     }
 }
 
-impl Attr<'_> {
+impl<'src> Attr<'src> {
     pub fn has_value(&self) -> bool {
         !matches!(self.value, AttrValue::None)
+    }
+
+    pub fn as_src_ptr(&self) -> *const u8 {
+        self.prefix_and_name.as_ptr()
+    }
+
+    pub fn name(&self) -> &'src str {
+        unsafe {
+            self.prefix_and_name.get_unchecked(self.name_start ..)
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+// Safety invariant: `!self.0.is_empty()`
+pub struct OpeningTagEnd<'src>(&'src str);
+
+impl Display for OpeningTagEnd<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if f.alternate() {
+            Display::fmt(&EscapeHtml(self.0), f)
+        } else {
+            Display::fmt(self.0, f)
+        }    
+    }
+}
+
+impl OpeningTagEnd<'_> {
+    pub fn as_src_ptr(&self) -> *const u8 {
+        unsafe {
+            self.0.as_ptr().add(self.0.len() - 1 - self.0.starts_with("/>") as usize)
+        }
+    }
+
+    pub fn is_self_closing(&self) -> bool {
+        self.0.ends_with("/>")
     }
 }
 
@@ -71,7 +120,7 @@ pub enum XmlFragment<'src, Cmd = ()> {
     /// `key=value` or key
     Attr(Attr<'src>),
     /// `/>` or `>`
-    OpeningTagEnd(&'src str),
+    OpeningTagEnd(OpeningTagEnd<'src>),
     /// </tagname>
     ClosingTag(&'src str),
     /// $VARNAME
@@ -86,21 +135,28 @@ pub enum XmlFragment<'src, Cmd = ()> {
 
 impl<Cmd: Display> Display for XmlFragment<'_, Cmd> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match self {
-            Self::OpeningTagStart(name) => write!(f, "<{}", name),
-            Self::Attr(attr) => write!(f, " {attr}"),
-            Self::OpeningTagEnd(s) => {
-                if s.starts_with('/') {
-                    f.write_str(" />")
-                } else {
-                    f.write_char('>')
-                }
+        if f.alternate() {
+            match self {
+                Self::OpeningTagStart(name) => write!(f, "&lt;{}", EscapeHtml(name)),
+                Self::Attr(attr) => write!(f, "{attr:#}"),
+                Self::OpeningTagEnd(s) => write!(f, "{s:#}"),
+                Self::ClosingTag(name) => write!(f, "&lt;/{}&gt;", EscapeHtml(name)),
+                Self::Var(name) => write!(f, "${}", EscapeHtml(name)),
+                Self::Expr(expr) => write!(f, "$({})", EscapeHtml(expr)),
+                Self::Text(text) => Display::fmt(&EscapeHtml(text), f),
+                Self::Internal(i) => write!(f, "$__internal({i})"),
             }
-            Self::ClosingTag(name) => write!(f, "</{}>", name),
-            Self::Var(name) => write!(f, "${}", name),
-            Self::Expr(expr) => write!(f, "$({})", expr),
-            Self::Text(text) => Display::fmt(text, f),
-            Self::Internal(i) => write!(f, "$__internal({i})"),
+        } else {
+            match self {
+                Self::OpeningTagStart(name) => write!(f, "<{name}"),
+                Self::Attr(attr) => write!(f, "{attr}"),
+                Self::OpeningTagEnd(s) => write!(f, "{s}"),
+                Self::ClosingTag(name) => write!(f, "</{name}>"),
+                Self::Var(name) => write!(f, "${name}"),
+                Self::Expr(expr) => write!(f, "$({expr})"),
+                Self::Text(text) => Display::fmt(text, f),
+                Self::Internal(i) => write!(f, "$__internal({i})"),
+            }
         }
     }
 }
@@ -109,9 +165,9 @@ impl<Cmd> XmlFragment<'_, Cmd> {
     /// For error reporting
     pub fn as_src_ptr(&self) -> *const u8 {
         match self {
-            Self::OpeningTagStart(s)
-            | Self::Attr(Attr { name: s, .. })
-            | Self::OpeningTagEnd(s)
+            Self::Attr(attr) => attr.as_src_ptr(),
+            Self::OpeningTagEnd(tag) => tag.as_src_ptr(),
+            | Self::OpeningTagStart(s)
             | Self::ClosingTag(s)
             | Self::Var(s)
             | Self::Expr(s)
@@ -122,7 +178,7 @@ impl<Cmd> XmlFragment<'_, Cmd> {
 }
 
 fn ident_char(input: &str) -> IResult<&str, char> {
-    satisfy(|c: char| c.is_alphanumeric() || c == '_')(input)
+    satisfy(|c: char| c.is_alphanumeric() || c == '_' || c == '-')(input)
 }
 
 fn word(input: &str) -> IResult<&str, &str> {
@@ -137,10 +193,6 @@ fn string_literal(input: &str) -> IResult<&str, &str> {
     delimited(char('"'), is_not("\""), char('"')).parse(input)
 }
 
-fn attr_name(input: &str) -> IResult<&str, &str> {
-    ident_char.or(prefix).and(many0_count(ident_char)).recognize().parse(input)
-}
-
 fn attr_value(input: &str) -> IResult<&str, AttrValue> {
     alt((
         map(template_expr, AttrValue::Expr),
@@ -151,9 +203,15 @@ fn attr_value(input: &str) -> IResult<&str, AttrValue> {
 }
 
 fn attr(input: &str) -> IResult<&str, Attr> {
-    attr_name
-        .and(prefixed(char('='), attr_value).opt())
-        .map(|(name, value)| Attr { name, value: value.unwrap_or_default() })
+    let (input, (prefix_and_name, name_start)) = whitespace
+        .and(ident_char.or(prefix))
+        .and(many0_count(ident_char))
+        .map(|((prefix, _), name_len): ((&str, char), usize)| unsafe {
+            (str_from_raw_parts(prefix.as_ptr(), prefix.len() + 1 + name_len), prefix.len())
+        })
+        .parse(input)?;
+    prefixed(char('='), attr_value).opt()
+        .map(|v| Attr { prefix_and_name, name_start, value: v.unwrap_or_default() })
         .parse(input)
 }
 
@@ -168,6 +226,10 @@ fn template_expr(input: &str) -> IResult<&str, &str> {
 /// the output is the element name
 fn opening_tag_start(input: &str) -> IResult<&str, &str> {
     prefixed(char('<'), word)(input)
+}
+
+fn opening_tag_end(input: &str) -> IResult<&str, OpeningTagEnd> {
+    recognize(whitespace.and(char('/').opt()).and(char('>'))).map(OpeningTagEnd).parse(input)
 }
 
 fn comment(input: &str) -> IResult<&str, &str> {
@@ -190,14 +252,10 @@ fn xml_fragment<Cmd>(input: &str) -> IResult<&str, XmlFragment<Cmd>> {
 }
 
 fn xml_fragment_in_opening_tag<Cmd>(input: &str) -> IResult<&str, XmlFragment<Cmd>> {
-    preceded(
-        whitespace.opt(),
-        alt((
-            map(tag("/>"), XmlFragment::OpeningTagEnd),
-            map(tag(">"), XmlFragment::OpeningTagEnd),
-            map(attr, XmlFragment::Attr),
-        )),
-    )(input)
+    alt((
+        map(opening_tag_end, XmlFragment::OpeningTagEnd),
+        map(attr, XmlFragment::Attr),
+    ))(input)
 }
 
 #[must_use = "use the `finish` method to properly handle a potential parsing error"]

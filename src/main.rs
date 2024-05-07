@@ -3,13 +3,15 @@ mod asset;
 mod parser;
 mod utils;
 mod mime;
+mod escape_html;
 
-use crate::utils::Result;
-use anyhow::{anyhow, Context};
+use crate::utils::{PathBufExt, Result};
+use anyhow::Context;
 use clap::Parser;
 use evaluator::Evaluator;
-use shrimple_localhost::{Request, RequestResult, Server, ServerError};
-use std::{env::set_current_dir, path::PathBuf};
+use notify::{recommended_watcher, Config, RecursiveMode::Recursive, Watcher};
+use shrimple_localhost::{print_request_result, Server, ServerError};
+use std::{env::set_current_dir, path::PathBuf, sync::atomic::{AtomicBool, Ordering}};
 
 #[derive(Parser)]
 #[command(name = "shrimple", author, version, about)]
@@ -27,14 +29,21 @@ struct Args {
     #[arg(long, short =  'p')]
     port: Option<u16>,
 
+    /// Use manual polling to detect file changes.
+    /// Has no effect without the `-w/--watch` option
+    #[arg(long)]
+    poll: bool,
+
     /// The root of the website, it's `index.html`
     #[arg(default_value = "index.html")]
     file: PathBuf,
 }
 
+static RECOMPILE: AtomicBool = AtomicBool::new(true);
+
 fn main() -> Result {
     let args = Args::parse();
-    let output = args.output.canonicalize().context("failed to locate the output root")?;
+    let output = args.output.canonicalize().context("failed to locate the output root")?.leak();
     let abs_file = args.file.canonicalize().context("failed to locate the source file")?;
     let root = abs_file.parent().context("invalid source file")?;
     set_current_dir(root)?;
@@ -42,42 +51,36 @@ fn main() -> Result {
         return Evaluator::default().eval_all(&abs_file, root, output)
     }
 
-    println!("First build before setting up the server...");
-    Evaluator::default().eval_all(&abs_file, root, &output)?;
     let port = args.port.unwrap_or(Server::DEFAULT_PORT);
-    let mut server = Server::new_at(&output, port)?;
-    let mut last_mtime = root.metadata()?.modified()?;
-    println!("Local server with hot-reloading set-up at http://127.0.0.1:{port}");
-    server.try_serve_with_callback(
-        |_, _| {
-            let mtime = root.metadata()?.modified()?;
-            if mtime <= last_mtime {
-                return Ok(())
-            }
-            last_mtime = mtime;
-            println!("Change detected, rebuilding website...");
-            Evaluator::default().eval_all(&abs_file, root, &output)
-        },
-        |addr, res| Ok(match res {
-            RequestResult::Ok(req) if req.client_cache_reused() => 
-                println!("{addr}:\n -> GET {}\n <- 304 Not Modified", req.path.display()),
-            RequestResult::Ok(req) => 
-                println!("{addr}:\n -> GET {}\n <- 200 OK", req.path.display()),
-            RequestResult::InvalidHttpMethod =>
-                println!("{addr}:\n -> <invalid HTTP method>\n <- 400 Bad Request"),
-            RequestResult::NoRequestedPath => 
-                println!("{addr}:\n -> <no requested path>\n <- 400 Bad Request"),
-            RequestResult::InvalidHttpVersion =>
-                println!("{addr}:\n -> <invalid HTTP version>\n <- 400 Bad Request"),
-            RequestResult::InvalidHeader => 
-                println!("{addr}:\n -> <invalid header(s)>\n <- 400 Bad Request"),
-            RequestResult::FileNotFound(path) =>
-                println!("{addr}:\n -> GET {}\n <- 404 Not Found", path.display()),
-        }),
-    )
-    .map(|r| match r {})
-    .map_err(|err| match err {
-        ServerError::Io(err) => anyhow!(err),
-        ServerError::Callback(err) => err,
-    })
+    let mut server = Server::new_at(output, port).context("failed to set up the local server")?;
+
+    let mut watcher = recommended_watcher(move |event: notify::Result<notify::Event>| match event {
+        Ok(event) => if event.paths.iter().any(|p| !p.starts_with(output)) {
+            RECOMPILE.store(true, Ordering::Relaxed)
+        }
+        Err(err) => eprintln!("Error in the filesystem watcher:\n{err}"),
+    }).context("failed to configure the filesystem watcher")?;
+    if args.poll {
+        watcher.configure(Config::default().with_manual_polling())
+            .context("failed to set the filesystem watcher to manual polling")?;
+    }
+    watcher.watch(root, Recursive).context("failed to start the filesystem watcher")?;
+
+    println!("Local server with hot-reloading set up at http://127.0.0.1:{port}");
+    loop {
+        let err = server.try_serve_with_callback(
+            |_, _| {
+                if !RECOMPILE.swap(false, Ordering::Relaxed) {
+                    return Ok(())
+                }
+                println!("Change detected, rebuilding website...");
+                Evaluator::default().eval_all(&abs_file, root, output)
+            },
+            |addr, res| Ok(print_request_result(addr, res)),
+        ).unwrap_err();
+        match err {
+            ServerError::Io(err) => println!("IO error: {err}"),
+            ServerError::Callback(err) => println!("{err:?}"),
+        }
+    }
 }

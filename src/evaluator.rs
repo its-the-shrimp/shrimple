@@ -284,7 +284,7 @@ impl Evaluator {
     fn for_each_inner_xml<'tag_name>(
         tag_name: impl StrLike<'tag_name>,
         ctx: &mut EvalCtx,
-        mut f: impl FnMut(XmlFragment),
+        mut f: impl FnMut(XmlFragment) -> Result,
     ) -> Result {
         let mut nesting = 0usize;
         for frag in ctx {
@@ -299,14 +299,14 @@ impl Evaluator {
                 }
                 _ => (),
             }
-            f(frag);
+            f(frag)?;
         }
         bail!("expected `</{tag_name}>`, instead got EOF")
     }
 
     fn collect_inner_xml<'tag>(tag_name: impl StrLike<'tag>, ctx: &mut EvalCtx) -> Result<String> {
         let mut res = String::new();
-        Self::for_each_inner_xml(tag_name, ctx, |frag| _ = write!(&mut res, "{frag}"))?;
+        Self::for_each_inner_xml(tag_name, ctx, |frag| Ok(write!(&mut res, "{frag}")?))?;
         Ok(res)
     }
 
@@ -315,7 +315,7 @@ impl Evaluator {
         ctx: &mut EvalCtx,
     ) -> Result<Vec<XmlFragment>> {
         let mut res = vec![];
-        Self::for_each_inner_xml(tag_name, ctx, |frag| res.push(frag))?;
+        Self::for_each_inner_xml(tag_name, ctx, |frag| Ok(res.push(frag)))?;
         Ok(res)
     }
 
@@ -325,10 +325,10 @@ impl Evaluator {
         mut f: impl FnMut(&XmlFragment),
     ) -> Result<Vec<XmlFragment>> {
         let mut res = vec![];
-        Self::for_each_inner_xml(tag_name, ctx, |frag| {
+        Self::for_each_inner_xml(tag_name, ctx, |frag| Ok({
             f(&frag);
             res.push(frag);
-        })?;
+        }))?;
         Ok(res)
     }
 
@@ -336,12 +336,12 @@ impl Evaluator {
         let mut attr = None;
         let mut remote_cached = false;
         let mut needs_processing = None;
-        let Some(Attr { name, value }) = (loop {
+        let Some(attr) = (loop {
             match ctx.next() {
                 None => {
                     bail!("expected `<ref_name>=<ref_path>`, `raw`, `processed`, instead got EOF")
                 }
-                Some(XmlFragment::Attr(new_attr)) => match new_attr.name {
+                Some(XmlFragment::Attr(new_attr)) => match new_attr.name() {
                     "raw" | "processed" if needs_processing.is_some() => {
                         bail!("can't specify more than 1 processing mode")
                     }
@@ -363,12 +363,13 @@ impl Evaluator {
         }) else {
             bail!("neither variable name nor path provided")
         };
+        let name = attr.name();
 
         let Some(name) = name.strip_prefix('$') else {
             bail!("`$ref` only accepts a variable name prefixed with `$`, instead got {name:?}")
         };
 
-        let path = self.eval_attr_value(&value, ctx)?.context("no file path provided")?;
+        let path = self.eval_attr_value(&attr.value, ctx)?.context("no file path provided")?;
         if remote_cached {
             let (id, ext) = self.cache_remote_asset(&path)?;
             let mut buf = short_str!("/cached/", len: 64);
@@ -383,9 +384,9 @@ impl Evaluator {
 
     fn handle_lua_template(&mut self, ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
         match ctx.next() {
-            Some(XmlFragment::OpeningTagEnd(">")) => (),
+            Some(XmlFragment::OpeningTagEnd(t)) if !t.is_self_closing() => (),
             Some(XmlFragment::Attr(_)) => bail!("`$lua` doesn't accept any attributes"),
-            Some(XmlFragment::OpeningTagEnd("/>")) => bail!("`$lua` must have children"),
+            Some(XmlFragment::OpeningTagEnd(_)) => bail!("`$lua` must have children"),
             None => bail!("expected `>`, instead got EOF"),
             _ => bail!("unexpected input"),
         }
@@ -401,29 +402,34 @@ impl Evaluator {
             match ctx.next() {
                 None => bail!("expected attributes, `>` or `/>`, instead got EOF"),
 
-                Some(XmlFragment::Attr(Attr { name: "acceptsChildren", value })) => {
-                    ensure!(value == AttrValue::None, "`acceptsChildren` must have no value");
-                    accepts_children = true
-                }
-
-                Some(XmlFragment::Attr(Attr { name: "name", value })) => match value {
-                    AttrValue::None => bail!("no template name provided"),
-                    AttrValue::Var(_) | AttrValue::Expr(_) => {
-                        bail!("template name can only be a literal")
+                Some(XmlFragment::Attr(attr)) => match attr.name() {
+                    "acceptsChildren" => {
+                        ensure!(!attr.has_value(), "`acceptsChildren` must have no value");
+                        accepts_children = true
                     }
-                    AttrValue::Text(text) => name = Some(text),
-                },
 
-                Some(XmlFragment::Attr(Attr { name, value })) => {
-                    let Some(name) = name.strip_prefix('$') else {
-                        bail!("`$template` doesn't have an attribute `{name}`")
-                    };
-                    attrs.push(TemplateAttr { name, default: self.eval_attr_value(&value, ctx)? })
+                    "name" => match attr.value {
+                        AttrValue::None => bail!("no template name provided"),
+                        AttrValue::Var(_) | AttrValue::Expr(_) => {
+                            bail!("template name can only be a literal")
+                        }
+                        AttrValue::Text(text) => name = Some(text),
+                    }
+
+                    name => {
+                        let Some(name) = name.strip_prefix('$') else {
+                            bail!("`$template` doesn't have an attribute `{name}`")
+                        };
+                        attrs.push(TemplateAttr {
+                            name,
+                            default: self.eval_attr_value(&attr.value, ctx)?,
+                        })
+                    }
                 }
 
-                Some(XmlFragment::OpeningTagEnd("/>")) => break default(),
+                Some(XmlFragment::OpeningTagEnd(t)) if t.is_self_closing() => break default(),
 
-                Some(XmlFragment::OpeningTagEnd(">")) => {
+                Some(XmlFragment::OpeningTagEnd(_)) => {
                     break Self::collect_inner_xml_fragments("$template", ctx)?.into()
                 }
 
@@ -441,14 +447,21 @@ impl Evaluator {
     }
 
     /// paste children passed to the invocation of the currently expanded template
-    fn handle_children_template(&mut self, ctx: &mut EvalCtx) -> Result {
-        match ctx.next() {
-            Some(XmlFragment::OpeningTagEnd("/>")) => (),
-            Some(XmlFragment::OpeningTagEnd(">")) => bail!("`$children` doesn't accept children"),
-            Some(XmlFragment::Attr(_)) => bail!("`$children` doesn't accept any attributes"),
-            None => bail!("expected `/>`, instead got EOF"),
+    fn handle_children_template(&mut self, ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
+        let raw = match ctx.next() {
+            Some(XmlFragment::OpeningTagEnd(t)) if t.is_self_closing() => false,
+            Some(XmlFragment::OpeningTagEnd(_)) => bail!("`$children` doesn't accept children"),
+            Some(XmlFragment::Attr(a)) if a.name() == "raw" => {
+                match ctx.next() {
+                    Some(XmlFragment::OpeningTagEnd(t)) if t.is_self_closing() => (),
+                    _ => bail!("expected `/>`"),
+                }
+                true
+            }
+            None => bail!("expected `raw` or `/>`, instead got EOF"),
             _ => bail!("unexpected input"),
-        }
+        };
+
         let Some(Expansion { index, children }) = ctx.expansions.last() else {
             bail!("`$children` can only be used in the children of a template declaraion")
         };
@@ -456,34 +469,44 @@ impl Evaluator {
             let name = self.templates[*index].name;
             bail!("`${name}` doesn't accept children so `$children` can't be used in it")
         };
-        // Safety: per `IterCtx::enqueue`, `ctx.expansions` won't be changed
-        ctx.enqueue(unsafe {assume_static(children)}.iter().copied());
+
+        if raw {
+            for frag in &**children {
+                write!(dst, "{frag:#}")?
+            }
+        } else {
+            // Safety: per `IterCtx::enqueue`, `ctx.expansions` won't be changed
+            ctx.enqueue(unsafe {assume_static(children)}.iter().copied())
+        }
         Ok(())
     }
 
     fn handle_foreach_template(&mut self, ctx: &mut EvalCtx) -> Result {
         let var_name = match ctx.next() {
-            Some(XmlFragment::Attr(Attr { name, value: AttrValue::None })) => name
+            Some(XmlFragment::Attr(attr)) if !attr.has_value() => attr.name()
                 .strip_prefix('$')
                 .context("name of the declared variable must be prefixed with `$`")?,
             Some(XmlFragment::Attr(_)) => bail!("extraneous `=...`"),
             None => bail!("expected iterable variable name, instead got EOF"),
             _ => bail!("expected iterable variable name"),
         };
-        ensure!(
-            ctx.next() == Some(XmlFragment::Attr(Attr { name: "in", value: AttrValue::None })),
-            "expected `in`",
-        );
+        match ctx.next() {
+            Some(XmlFragment::Attr(a)) if !a.has_value() && a.name() == "in" => (),
+            _ => bail!("expected `in`"),
+        }
         let dir = match ctx.next() {
-            Some(XmlFragment::Attr(Attr { name: "dir", value })) => self
-                .eval_attr_value(&value, ctx)?
+            Some(XmlFragment::Attr(a)) if a.name() == "dir" => self
+                .eval_attr_value(&a.value, ctx)?
                 .context("attribute `dir` must have a value that is the iterated directory")?,
             None => bail!("expected `dir=...`, instead got EOF"),
             _ => bail!("expected `dir=...`"),
         };
         let iter =
             read_dir(&*dir).with_context(|| format!("Failed to iterate directory {dir:?}"))?;
-        ensure!(ctx.next() == Some(XmlFragment::OpeningTagEnd(">")), "Expected `>`");
+        match ctx.next() {
+            Some(XmlFragment::OpeningTagEnd(t)) if !t.is_self_closing() => (),
+            _ => bail!("Expected `>`"),
+        }
 
         let iter_ctx = IterCtx {
             var_name,
@@ -498,7 +521,7 @@ impl Evaluator {
     fn handle_registerprocessedext_template(&mut self, ctx: &mut EvalCtx) -> Result {
         let ext = match ctx.next() {
             None => bail!("expected file extension, instead got EOF"),
-            Some(XmlFragment::Attr(Attr { name, value: AttrValue::None })) => name,
+            Some(XmlFragment::Attr(a)) if !a.has_value() => a.name(),
             Some(XmlFragment::Attr(_)) => {
                 bail!("the argument must be the file extension without the dot, remove `=...`")
             }
@@ -507,7 +530,10 @@ impl Evaluator {
         if ext.starts_with('.') {
             bail!("the file extension must not start with a dot")
         }
-        ensure!(ctx.next() == Some(XmlFragment::OpeningTagEnd("/>")), "expected `/>`");
+        match ctx.next() {
+            Some(XmlFragment::OpeningTagEnd(t)) if t.is_self_closing() => (),
+            _ => bail!("expected `/>`"),
+        }
 
         self.processed_exts.push(os_str(ext));
         Ok(())
@@ -537,6 +563,36 @@ impl Evaluator {
         Ok(())
     }
 
+    fn handle_raw_template(&mut self, mut ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
+        let element_name = match ctx.next() {
+            Some(XmlFragment::Attr(attr)) if !attr.has_value() => {
+                let name = attr.name();
+                write!(dst, "<{name}")?;
+                for frag in &mut ctx {
+                    write!(dst, "{frag}")?;
+                    if matches!(frag, XmlFragment::OpeningTagEnd(_)) {
+                        break
+                    }
+                }
+                Some(name)
+            }
+            Some(XmlFragment::Attr(_)) => bail!("element name is an attribute without value\n\
+                                                remove the `=...`"),
+            Some(XmlFragment::OpeningTagEnd(a)) if a.is_self_closing() => return Ok(()),
+            Some(XmlFragment::OpeningTagEnd(_)) => {
+                dst.write_char('>')?;
+                None
+            }
+            Some(_) => bail!("expected `>`, `/>` or element name"),
+            None => bail!("expected `>`, `/>` or element name, instead got EOF"),
+        };
+        Self::for_each_inner_xml("$raw", ctx, |frag| Ok(write!(dst, "{frag:#}")?))?;
+        if let Some(element_name) = element_name {
+            write!(dst, "</{element_name}>")?
+        }
+        Ok(())
+    }
+
     /// Handle a user-defined template.
     /// `name` is without the leading `$`.
     fn handle_template(&mut self, name: &'static str, ctx: &mut EvalCtx) -> Result {
@@ -557,8 +613,9 @@ impl Evaluator {
                 }
 
                 XmlFragment::Attr(attr) => {
-                    let Some(id) = attrs.iter().position(|a| *a.name == *attr.name) else {
-                        bail!("template `{name}` has no attribute `{}`", attr.name)
+                    let attr_name = attr.name();
+                    let Some(id) = attrs.iter().position(|a| *a.name == *attr_name) else {
+                        bail!("template `{name}` has no attribute `{attr_name}`")
                     };
                     attrs[id].default = self.eval_attr_value(&attr.value, ctx)?;
                 }
@@ -570,7 +627,7 @@ impl Evaluator {
                         };
                         self.set_lua_var(attr.name, value)?;
                     }
-                    let expansion = if t.starts_with('/') {
+                    let expansion = if t.is_self_closing() {
                         Expansion { index, children: accepts_children.then(default) }
                     } else {
                         ensure!(accepts_children, "`${name}` doesn't accept children");
@@ -580,14 +637,16 @@ impl Evaluator {
                             ctx,
                             |f| can_recurse = match f {
                                 XmlFragment::OpeningTagStart("$children") => true,
-                                XmlFragment::OpeningTagEnd("$template") => false,
+                                XmlFragment::ClosingTag("$template") => false,
                                 _ => return,
                             }
                         )?;
                         if can_recurse {
+                            // TODO: report the location of this error
                             bail!("using `<$children>` in template children is disallowed \
                                    as it'd lead to infinite recursion")
                         }
+
                         Expansion {
                             index,
                             children: children.into_boxed_slice().into(),
@@ -623,10 +682,11 @@ impl Evaluator {
         let mut cached = false;
         while let Some(frag) = ctx.next() {
             match frag {
-                XmlFragment::Attr(Attr { name: attr_name, value }) => {
-                    let value = self.eval_attr_value(&value, ctx)?;
+                XmlFragment::Attr(attr) => {
+                    let value = self.eval_attr_value(&attr.value, ctx)?;
+                    let attr_name = attr.name();
                     let Some(value) = value else {
-                        match attr_name {
+                        match attr.name() {
                             "$cached" => cached = true,
                             x => ensure!(!x.starts_with('$'), "unknown special attribute: {x:?}"),
                         }
@@ -665,8 +725,13 @@ impl Evaluator {
                         }
 
                         (true, false) => { // ref attr, not cached
-                            self.add_asset(Asset::new(&*value, None, &self.processed_exts)?)?;
-                            write!(dst, "=\"/{value}\"")?
+                            let value = value.trim_start_matches('/');
+                            if !value.is_empty() && url_scheme(value).is_none() {
+                                self.add_asset(Asset::new(value, None, &self.processed_exts)?)?;
+                                write!(dst, "=\"/{value}\"")?
+                            } else {
+                                write!(dst, "=\"{value}\"")?
+                            }
                         }
 
                         (false, true) => { // not ref attr, cached
@@ -685,7 +750,7 @@ impl Evaluator {
                 }
 
                 XmlFragment::OpeningTagEnd(t) => {
-                    match (IS_VOID, t.starts_with('/')) {
+                    match (IS_VOID, t.is_self_closing()) {
                         (true, true) => dst.write_char('>')?,
                         (true, false) => bail!("element {name} must be self-closing"),
                         (false, true) => write!(dst, "></{name}>")?,
@@ -736,9 +801,10 @@ impl Evaluator {
                     "$ref" => self.handle_ref_template(ctx)?,
                     "$lua" => self.handle_lua_template(ctx, dst)?,
                     "$template" => self.handle_template_template(ctx)?,
-                    "$children" => self.handle_children_template(ctx)?,
+                    "$children" => self.handle_children_template(ctx, dst)?,
                     "$foreach" => self.handle_foreach_template(ctx)?,
                     "$registerProcessedExt" => self.handle_registerprocessedext_template(ctx)?,
+                    "$raw" => self.handle_raw_template(ctx, dst)?,
                     "a"     |
                     "image" => self.handle_element(name, ctx, dst, &["href"], &mut tag_stack)?,
                     "link" => self.handle_void_element(name, ctx, dst, &["href"])?,

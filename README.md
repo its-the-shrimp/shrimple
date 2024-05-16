@@ -31,4 +31,10 @@ Use `$VAR` to access a Lua variable, and `$(code)` or `<$lua>code</$lua>` to eva
 No need to deliberately specify `index.css`, `image.png`, etc. as an asset: if you mention it in HTML, it'll be registered automatically.
 In the example above, the file `shrimp.png` is mentioned in `image` element's `href` attribuet, so it will automatically be searched
 in the same directory where `index.html` is, and will be copied to the output directory.
-TODO: fetching of assets from external sources.
+
+If the asset is somewhere out there on the vast plains of the Internet, and you wish to make sure it's always available to your users,
+you can cache it! just prefix the attribute containing the link with `$cached`, and you're all set.
+
+### 4. Iterate quickly
+The CLI comes with a very handy flag: call `shrimple -w` or `shrimple --watch` to spin up a lightweight local server
+that'll recompile your website as needed and show it to you right in the browser.

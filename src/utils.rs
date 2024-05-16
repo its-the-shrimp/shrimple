@@ -1,103 +1,22 @@
-use nom::character::complete::{char, satisfy};
-use nom::combinator::{cut, opt, peek, recognize};
-use nom::error::{Error as NomError, ErrorKind as NomErrorKind, ParseError};
-use nom::multi::many0_count;
-use nom::sequence::{delimited, preceded};
-use nom::{AsChar, IResult, InputIter, InputLength};
-use nom::{Offset, Parser, Slice};
 use core::slice;
 use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::fmt::{self, Debug, Display, Formatter, Write};
 use std::mem::transmute;
-use std::ops::{RangeFrom, RangeTo};
 use std::ptr::copy_nonoverlapping;
-use std::slice::from_raw_parts;
 use std::str::from_utf8_unchecked;
 use std::path::{Path, PathBuf};
 
 pub type Result<T = (), E = anyhow::Error> = std::result::Result<T, E>;
 
-pub trait ParserExt<I, O>: Sized + Parser<I, O, NomError<I>> {
-    /// `recognize()` as a method
-    fn recognize(self) -> impl Parser<I, I, NomError<I>>
-    where
-        I: Clone + Offset + Slice<RangeTo<usize>>,
-    {
-        recognize(self)
-    }
-
-    /// equialent to `.and(next).map(|(prev, _new)| prev)`
-    fn trim<O2>(self, other: impl Parser<I, O2, NomError<I>>) -> impl Parser<I, O, NomError<I>> {
-        self.and(other).map(first)
-    }
-
-    /// turns a recoverable error into a success value with `None` as the output
-    fn opt(self) -> impl Parser<I, Option<O>, NomError<I>>
-    where
-        I: Clone,
-    {
-        opt(self)
-    }
-
-    fn peek<P>(self, parser: impl Parser<I, P, NomError<I>>) -> impl Parser<I, O, NomError<I>>
-    where
-        I: Clone,
-    {
-        self.trim(peek(parser))
-    }
-}
-
-impl<I, O, T: Parser<I, O, NomError<I>>> ParserExt<I, O> for T {}
-
-pub fn whitespace<I>(input: I) -> IResult<I, I>
-where
-    I: Slice<RangeTo<usize>> + Slice<RangeFrom<usize>> + InputIter + Clone + InputLength + Offset,
-    <I as InputIter>::Item: AsChar,
-{
-    many0_count(satisfy(|c: char| c.is_ascii_whitespace())).recognize().parse(input)
-}
-
-pub fn group(open: char, close: char) -> impl Fn(&str) -> IResult<&str, &str> {
-    move |input| {
-        let (src, _) = char(open)(input)?;
-        let mut depth = 0usize;
-        for (at, ch) in src.char_indices() {
-            if ch == close {
-                if depth == 0 {
-                    let (res, src) = src.split_at(at);
-                    return Ok((&src[1..], res));
-                }
-                depth -= 1
-            } else if ch == open {
-                depth += 1
-            }
-        }
-        Err(nom::Err::Failure(NomError::new(src, NomErrorKind::Many1Count)))
-    }
-}
-
-/// equivalent to `preceded(first, cut(second))`
-pub fn prefixed<I, P, O, E: ParseError<I>>(
-    first: impl Parser<I, P, E>,
-    second: impl Parser<I, O, E>,
-) -> impl FnMut(I) -> IResult<I, O, E> {
-    preceded(first, cut(second))
-}
-
-/// equivalent to `delimited(prefix, cut(main), cut(postfix))`
-pub fn surrounded<I, Prefix, O, Postfix, E: ParseError<I>>(
-    first: impl Parser<I, Prefix, E>,
-    main: impl Parser<I, O, E>,
-    postfix: impl Parser<I, Postfix, E>,
-) -> impl FnMut(I) -> IResult<I, O, E> {
-    delimited(first, cut(main), cut(postfix))
+pub fn is_in<T: Eq>(items: impl AsRef<[T]>) -> impl Fn(&T) -> bool {
+    move |item| items.as_ref().contains(item)
 }
 
 /// Exists to compare/print strings as if they had an additional char `P` before them, without
 /// allocating
 #[repr(transparent)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Prefixed<const P: char, T>(pub T);
 
 impl<const P: char, T: PartialEq<str>> PartialEq<str> for Prefixed<P, T> {
@@ -113,7 +32,7 @@ impl<'str, const P: char, T: PartialEq<&'str str>> PartialEq<&'str str> for Pref
 }
 
 impl<const P: char, T: Display> Display for Prefixed<P, T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         Display::fmt(&P, f)?;
         Display::fmt(&self.0, f)
     }
@@ -124,6 +43,7 @@ pub fn default<T: Default>() -> T {
 }
 
 pub const fn os_str(x: &str) -> &OsStr {
+    // SAFETY: `str` & `OsStr` have the same layout, and `OsStr`'s encoding is a superset of UTF-8
     unsafe { transmute(x) }
 }
 
@@ -147,21 +67,12 @@ impl PathBufExt for PathBuf {
     }
 }
 
-pub fn first<T1, T2>(x: (T1, T2)) -> T1 {
-    x.0
-}
-
 pub unsafe fn assume_static<T>(x: &T) -> &'static T {
     transmute(x)
 }
 
 pub unsafe fn assume_static_mut<T>(x: &mut T) -> &'static mut T {
     transmute(x)
-}
-
-/// TODO: remove when [`std::str::from_raw_parts`] is stabilised
-pub const unsafe fn str_from_raw_parts<'str>(data: *const u8, len: usize) -> &'str str {
-    from_utf8_unchecked(from_raw_parts(data, len))
 }
 
 #[derive(Clone, Copy)]
@@ -172,13 +83,13 @@ pub struct ShortStr<const CAP: usize = 15> {
 }
 
 impl<const CAP: usize> Debug for ShortStr<CAP> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         Debug::fmt(self.as_str(), f)
     }
 }
 
 impl<const CAP: usize> Display for ShortStr<CAP> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         Display::fmt(self.as_str(), f)
     }
 }
@@ -204,7 +115,6 @@ impl<const CAP: usize> Ord for ShortStr<CAP> {
 }
 
 impl<const CAP: usize> AsRef<str> for ShortStr<CAP> {
-    #[inline(always)]
     fn as_ref(&self) -> &str {
         self.as_str()
     }
@@ -218,13 +128,15 @@ impl<const CAP: usize> Default for ShortStr<CAP> {
 
 impl<const CAP: usize> Write for ShortStr<CAP> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        if self.len() + s.len() > CAP {
+        let s_len: u8 = s.len().try_into().map_err(|_| fmt::Error)?;
+        if self.len() + s_len as usize > CAP {
             return Err(fmt::Error);
         }
+        // SAFETY: the condition above asserts that `self` has at least `s_len` free bytes
         unsafe {
             let rest = self.buf.as_mut_ptr().add(self.len());
-            copy_nonoverlapping(s.as_ptr(), rest, s.len());
-            self.len += s.len() as u8;
+            copy_nonoverlapping(s.as_ptr(), rest, s_len as usize);
+            self.len += s_len;
         }
         Ok(())
     }
@@ -255,6 +167,7 @@ macro_rules! short_str {
 
 impl<const CAP: usize> ShortStr<CAP> {
     /// returns `None` if `src`'s length is over `CAP`
+    #[allow(clippy::cast_possible_truncation, /*reason=" no other sensible way in const fn "*/)]
     pub const fn new(src: &str) -> Option<Self> {
         let len = src.len();
         if CAP > u8::MAX as usize || len > CAP {return None}
@@ -262,6 +175,8 @@ impl<const CAP: usize> ShortStr<CAP> {
         let mut i = 0;
         let mut ptr = src.as_ptr();
         while i < len {
+            // SAFETY: `ptr` & `len` are all parts of `src` & the loop condition asserts that `ptr`
+            // won't be advanced for more than `len` bytes forward
             unsafe {
                 buf[i] = *ptr;
                 ptr = ptr.add(1);
@@ -275,8 +190,9 @@ impl<const CAP: usize> ShortStr<CAP> {
         self.len as usize
     }
 
-    #[inline(always)]
     pub const fn as_str(&self) -> &str {
+        // SAFETY: `new` & `write_str` are the only functions that modify the string, and they only
+        // write `&str`s to it.
         unsafe {from_utf8_unchecked(slice::from_raw_parts(self.buf.as_ptr(), self.len as usize))}
     }
 }

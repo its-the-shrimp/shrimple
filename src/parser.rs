@@ -1,17 +1,14 @@
-use crate::{
-    asset::Asset, escape_html::EscapeHtml, utils::{first, group, prefixed, str_from_raw_parts, surrounded, whitespace, ParserExt, Result}
+use shrimple_parser::{
+    from_tuple, parse_char, parse_exact, parse_group, parse_until, parse_until_ex, parse_until_exact, parse_while, tuple::{first, second}, utils::{eq, ne}, FullParsingError, Parser
 };
-use nom::{
-    branch::alt,
-    bytes::complete::{is_not, tag, take_until1},
-    character::complete::{char, satisfy},
-    combinator::{map, recognize},
-    multi::{many0_count, many1_count},
-    sequence::delimited,
-    IResult, Parser,
+
+use crate::{
+    asset::Asset,
+    escape_html::EscapeHtml,
+    utils::{is_in, Result}
 };
 use std::{
-    fmt::{self, Debug, Display, Formatter}, marker::PhantomData, mem::replace, ptr::null, 
+    convert::Infallible, error::Error, fmt::{self, Debug, Display, Formatter}, ptr::null
 };
 
 #[derive(Debug, PartialEq, Eq, Default, Clone, Copy)]
@@ -58,32 +55,30 @@ pub struct Attr<'src> {
 impl Display for Attr<'_> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         if f.alternate() {
-            if !self.has_value() {
-                Display::fmt(&EscapeHtml(self.prefix_and_name), f)
-            } else {
+            if self.has_value() {
                 write!(f, "{}={:#}", EscapeHtml(self.prefix_and_name), self.value)
+            } else {
+                Display::fmt(&EscapeHtml(self.prefix_and_name), f)
             }
-        } else if !self.has_value() {
-            Display::fmt(self.prefix_and_name, f)
-        } else {
+        } else if self.has_value() {
             write!(f, "{}={}", self.prefix_and_name, self.value)
+        } else {
+            Display::fmt(self.prefix_and_name, f)
         }
     }
 }
 
 impl<'src> Attr<'src> {
-    pub fn has_value(&self) -> bool {
+    pub const fn has_value(&self) -> bool {
         !matches!(self.value, AttrValue::None)
     }
 
-    pub fn as_src_ptr(&self) -> *const u8 {
+    pub const fn as_src_ptr(&self) -> *const u8 {
         self.prefix_and_name.as_ptr()
     }
 
     pub fn name(&self) -> &'src str {
-        unsafe {
-            self.prefix_and_name.get_unchecked(self.name_start ..)
-        }
+        &self.prefix_and_name[self.name_start ..]
     }
 }
 
@@ -103,9 +98,7 @@ impl Display for OpeningTagEnd<'_> {
 
 impl OpeningTagEnd<'_> {
     pub fn as_src_ptr(&self) -> *const u8 {
-        unsafe {
-            self.0.as_ptr().add(self.0.len() - 1 - self.0.starts_with("/>") as usize)
-        }
+        self.0.as_ptr().wrapping_add(self.0.len() - 1 - self.0.starts_with("/>") as usize)
     }
 
     pub fn is_self_closing(&self) -> bool {
@@ -113,8 +106,23 @@ impl OpeningTagEnd<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalCmd {
+    AdvanceIter,
+    EndExpansion,
+}
+
+impl Display for EvalCmd {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            Self::AdvanceIter => write!(f, "$[__advanceIter]"),
+            Self::EndExpansion => write!(f, "$[__endExpansion]"),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum XmlFragment<'src, Cmd = ()> {
+pub enum XmlFragment<'src> {
     /// <tagname
     OpeningTagStart(&'src str),
     /// `key=value` or key
@@ -130,10 +138,10 @@ pub enum XmlFragment<'src, Cmd = ()> {
     /// any other text
     Text(&'src str),
     /// used by the evaluator
-    Internal(Cmd),
+    Internal(EvalCmd),
 }
 
-impl<Cmd: Display> Display for XmlFragment<'_, Cmd> {
+impl Display for XmlFragment<'_> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         if f.alternate() {
             match self {
@@ -161,7 +169,7 @@ impl<Cmd: Display> Display for XmlFragment<'_, Cmd> {
     }
 }
 
-impl<Cmd> XmlFragment<'_, Cmd> {
+impl XmlFragment<'_> {
     /// For error reporting
     pub fn as_src_ptr(&self) -> *const u8 {
         match self {
@@ -177,108 +185,157 @@ impl<Cmd> XmlFragment<'_, Cmd> {
     }
 }
 
-fn ident_char(input: &str) -> IResult<&str, char> {
-    satisfy(|c: char| c.is_alphanumeric() || c == '_' || c == '-')(input)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expected {
+    ClosedTag,
+    Word,
+    StrLiteral,
+    TemplateExpr,
+    TemplateVarName,
+    AttrName,
+    Comment,
 }
 
-fn word(input: &str) -> IResult<&str, &str> {
-    is_not(" \t\n/>")(input)
+impl Display for Expected {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClosedTag => write!(f, "expected `/>` or `>`"),
+            Self::Word => write!(f, "expected a word terminated by whitespace, `/>` or `>`"),
+            Self::StrLiteral => write!(f, "expected a string terminated by `\"`"),
+            Self::TemplateExpr => write!(f, "expected an expression terminated by `)`"),
+            Self::TemplateVarName => write!(f, "expected a variable name"),
+            Self::AttrName => write!(f, "expected an attribute name"),
+            Self::Comment => write!(f, "expected a comment terminated by `-->`"),
+        }
+    }
 }
 
-fn prefix(input: &str) -> IResult<&str, char> {
-    char('$').parse(input)
+impl Error for Expected {}
+
+impl From<Infallible> for Expected {
+    fn from(value: Infallible) -> Self {
+        match value {}
+    }
 }
 
-fn string_literal(input: &str) -> IResult<&str, &str> {
-    delimited(char('"'), is_not("\""), char('"')).parse(input)
+type ParsingResult<'input, T = (), E = Expected> = shrimple_parser::ParsingResult<'input, T, E>;
+
+#[allow(clippy::trivially_copy_pass_by_ref, /* reason="easier to pass through parsers" */)]
+fn is_ident_char(ch: &char) -> bool {
+    ch.is_alphanumeric() || "_-$".contains(*ch)
 }
 
-fn attr_value(input: &str) -> IResult<&str, AttrValue> {
-    alt((
-        map(template_expr, AttrValue::Expr),
-        map(template_var, AttrValue::Var),
-        map(string_literal, AttrValue::Text),
-        map(word, AttrValue::Text),
-    ))(input)
+fn parse_word(input: &str) -> ParsingResult<&str> {
+    parse_until(is_in([' ', '\n', '\t', '/', '>'])).expect(Expected::Word)(input)
 }
 
-fn attr(input: &str) -> IResult<&str, Attr> {
-    let (input, (prefix_and_name, name_start)) = whitespace
-        .and(ident_char.or(prefix))
-        .and(many0_count(ident_char))
-        .map(|((prefix, _), name_len): ((&str, char), usize)| unsafe {
-            (str_from_raw_parts(prefix.as_ptr(), prefix.len() + 1 + name_len), prefix.len())
-        })
-        .parse(input)?;
-    prefixed(char('='), attr_value).opt()
-        .map(|v| Attr { prefix_and_name, name_start, value: v.unwrap_or_default() })
-        .parse(input)
+fn parse_whitespace(input: &str) -> ParsingResult<&str, Infallible> {
+    parse_while(char::is_ascii_whitespace)(input)
 }
 
-fn template_var(input: &str) -> IResult<&str, &str> {
-    prefixed(prefix, recognize(many1_count(ident_char)))(input)
+/// Recoverable if no initial double quote found
+fn parse_string_literal(input: &str) -> ParsingResult<&str> {
+    parse_char('"').then(parse_until_ex(eq('"')).expect(Expected::StrLiteral))(input)
 }
 
-fn template_expr(input: &str) -> IResult<&str, &str> {
-    prefixed(prefix.peek(char('(')), group('(', ')'))(input)
+/// Recoverable if no initial "$(" found
+fn parse_template_expr(input: &str) -> ParsingResult<&str> {
+    parse_char('$').then(parse_group('(', ')').narrow_reason(Expected::TemplateExpr))(input)
 }
 
-/// the output is the element name
-fn opening_tag_start(input: &str) -> IResult<&str, &str> {
-    prefixed(char('<'), word)(input)
+fn parse_template_var(input: &str) -> ParsingResult<&str> {
+    parse_char('$')
+        .then(parse_while(is_ident_char).filter(ne("")).expect(Expected::TemplateVarName))
+        (input)
 }
 
-fn opening_tag_end(input: &str) -> IResult<&str, OpeningTagEnd> {
-    recognize(whitespace.and(char('/').opt()).and(char('>'))).map(OpeningTagEnd).parse(input)
+fn parse_attr_value(input: &str) -> ParsingResult<AttrValue> {
+    parse_template_expr.map(AttrValue::Expr)
+        .or(parse_template_var.map(AttrValue::Var))
+        .or(parse_string_literal.map(AttrValue::Text))
+        .or(parse_word.map(AttrValue::Text))
+        (input)
 }
 
-fn comment(input: &str) -> IResult<&str, &str> {
-    prefixed(tag("<!--"), take_until1("-->")).trim(tag("-->")).parse(input)
+fn parse_attr(input: &str) -> ParsingResult<Attr> {
+    parse_whitespace
+        .map(str::len)
+        .skip(parse_while(is_ident_char))
+        .expect(Expected::AttrName)
+        .get_span()
+        .add(parse_char('=').then(parse_attr_value).or_value(AttrValue::None))
+        .map(from_tuple!(Attr { name_start, prefix_and_name, value }))
+        (input)
 }
 
-fn closing_tag(input: &str) -> IResult<&str, &str> {
-    surrounded(tag("</"), word, char('>'))(input)
+/// The output is the element name, without the `<`.
+/// Recoverable if no initial `<` is found.
+fn parse_opening_tag_start(input: &str) -> ParsingResult<&str> {
+    parse_char('<').then(parse_word)(input)
 }
 
-fn xml_fragment<Cmd>(input: &str) -> IResult<&str, XmlFragment<Cmd>> {
-    let (input, _) = many0_count(comment)(input)?;
-    alt((
-        map(closing_tag, XmlFragment::ClosingTag),
-        map(opening_tag_start, XmlFragment::OpeningTagStart),
-        map(template_expr, XmlFragment::Expr),
-        map(template_var, XmlFragment::Var),
-        map(is_not("$<"), XmlFragment::Text),
-    ))(input)
+/// Any returned error is recoverable.
+fn parse_opening_tag_end(input: &str) -> ParsingResult<OpeningTagEnd, Infallible> {
+    parse_whitespace
+        .maybe_skip(parse_char('/'))
+        .skip(parse_char('>'))
+        .get_span()
+        .map(second)
+        .map(OpeningTagEnd)
+        (input)
 }
 
-fn xml_fragment_in_opening_tag<Cmd>(input: &str) -> IResult<&str, XmlFragment<Cmd>> {
-    alt((
-        map(opening_tag_end, XmlFragment::OpeningTagEnd),
-        map(attr, XmlFragment::Attr),
-    ))(input)
+/// Recoverable if no initial `<!--` is found.
+fn parse_comment(input: &str) -> ParsingResult<&str> {
+    parse_exact("<!--").then(parse_until_exact("-->").expect(Expected::Comment))(input)
 }
 
-#[must_use = "use the `finish` method to properly handle a potential parsing error"]
-pub struct ShrimpleParser<Cmd> {
+fn parse_closing_tag(input: &str) -> ParsingResult<&str> {
+    parse_exact("</")
+        .then(parse_word)
+        .maybe_skip(parse_whitespace)
+        .skip(parse_char('>').expect(Expected::ClosedTag))
+        (input)
+}
+
+fn parse_xml_fragment(input: &str) -> ParsingResult<XmlFragment> {
+    parse_comment.repeat()
+        .then(parse_closing_tag.map(XmlFragment::ClosingTag)
+            .or(parse_opening_tag_start.map(XmlFragment::OpeningTagStart))
+            .or(parse_template_expr.map(XmlFragment::Expr))
+            .or(parse_template_var.map(XmlFragment::Var))
+            .or(parse_until(is_in(['$', '<']))
+                .map(XmlFragment::Text)
+                .narrow_reason(Expected::Word))
+            .or_map_rest(XmlFragment::Text))
+        (input)
+}
+
+fn parse_xml_fragment_in_opening_tag(input: &str) -> ParsingResult<XmlFragment> {
+    parse_opening_tag_end.map(XmlFragment::OpeningTagEnd)
+        .or(parse_attr.map(XmlFragment::Attr))
+        (input)
+}
+
+pub struct ShrimpleParser {
     file: Asset,
     input: &'static str,
     parsing_attrs: bool,
-    error: Result,
-    _cmd: PhantomData<Cmd>,
+    error: Result<(), FullParsingError<'static, Expected>>,
 }
 
-impl<Cmd: Copy> Iterator for ShrimpleParser<Cmd> {
-    type Item = XmlFragment<'static, Cmd>;
+impl Iterator for ShrimpleParser {
+    type Item = XmlFragment<'static>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.error.is_err() {
+        if self.error.is_err() || self.input.is_empty() {
             return None;
         }
 
         let res = if self.parsing_attrs {
-            xml_fragment_in_opening_tag(self.input)
+            parse_xml_fragment_in_opening_tag(self.input)
         } else {
-            xml_fragment(self.input)
+            parse_xml_fragment(self.input)
         };
         match res {
             Ok((input, res)) => {
@@ -287,31 +344,26 @@ impl<Cmd: Copy> Iterator for ShrimpleParser<Cmd> {
                     matches!(res, XmlFragment::OpeningTagStart(_) | XmlFragment::Attr(_));
                 Some(res)
             }
-            Err(nom::Err::Error(nom::error::Error { input: input @ "", .. })) => {
-                // to preserve the address
-                self.input = input;
-                None
-            }
             Err(e) => {
-                self.error = Err(self.file.wrap_nom_error(e));
+                self.error = Err(e.with_src_loc(self.file.path, self.file.src().unwrap_or("")));
                 None
             }
         }
     }
 }
 
-impl<Cmd> ShrimpleParser<Cmd> {
-    pub fn new(input: &'static str, file: Asset) -> Self {
-        Self { input, file, parsing_attrs: false, _cmd: PhantomData, error: Ok(()) }
+impl ShrimpleParser {
+    pub const fn new(input: &'static str, file: Asset) -> Self {
+        Self { input, file, parsing_attrs: false, error: Ok(()) }
     }
 
-    pub fn file(&self) -> &Asset {
+    pub const fn file(&self) -> &Asset {
         &self.file
     }
 
     /// returns
-    pub fn finish(&mut self) -> Result {
-        replace(&mut self.error, Ok(()))
+    pub const fn finish(self) -> Result<(), FullParsingError<'static, Expected>> {
+        self.error
     }
 }
 

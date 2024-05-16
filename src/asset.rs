@@ -1,27 +1,6 @@
 use crate::utils::{OptionExt, ShortStr};
-use anyhow::{anyhow, Context, Result};
-use nom::Needed;
+use anyhow::{Context, Result};
 use std::{ffi::OsStr, fs::read_to_string, path::Path};
-
-/// the return values are `[line, column]`
-pub fn ptr_to_loc(src: &str, ptr: *const u8) -> [usize; 2] {
-    if src.is_empty() {
-        return [0, 0];
-    }
-
-    let offset =
-        (ptr as usize).checked_sub(src.as_ptr() as usize).map_or(0, |x| x.min(src.len() - 1));
-    let [mut line, mut column] = [1, 0];
-    for byte in unsafe { src.get_unchecked(..=offset).bytes() } {
-        if byte == b'\n' {
-            line += 1;
-            column = 0
-        } else {
-            column += 1
-        }
-    }
-    [line, column]
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // the string stored in the state is the source code
@@ -88,7 +67,7 @@ impl Asset {
         })
     }
 
-    pub fn src(&self) -> Option<&'static str> {
+    pub const fn src(&self) -> Option<&'static str> {
         match &self.state {
             AssetState::Raw | AssetState::Cached{..} => None,
             AssetState::Template(src) | AssetState::Processed(src) => Some(src),
@@ -106,34 +85,21 @@ impl Asset {
             _ => None,
         }
     }
+}
 
-    /// `ptr` is saturated around the ends of the source code, thus, e.g. NULL will be treated as
-    /// the first byte of the source, `NULL - 1` - as the last
-    pub fn locate(&self, ptr: *const u8) -> String {
-        if let Some(src) = self.src() {
-            let [line, column] = ptr_to_loc(src, ptr);
-            format!("{}:{line}:{column}", self.path.display())
-        } else {
-            self.path.to_string_lossy().into_owned()
-        }
-    }
-
-    /// `desc` should be a nominal clause, i.e. `parsing`, `template expansion`, etc.
-    pub fn wrap(&self, error: anyhow::Error, ptr: *const u8, desc: &str) -> anyhow::Error {
-        anyhow!(error).context(format!("{desc} error at {}", self.locate(ptr)))
-    }
-
-    /// Exists in part because `nom::Err`'s `Display` impl is nonsense
-    pub fn wrap_nom_error(&self, error: nom::Err<nom::error::Error<&str>>) -> anyhow::Error {
-        match error {
-            nom::Err::Incomplete(Needed::Size(u)) => anyhow!("Parsing requires {u} bytes/chars"),
-            nom::Err::Incomplete(Needed::Unknown) => anyhow!("Parsing requires more data"),
-            nom::Err::Failure(e) => {
-                anyhow!("Parsing failure at {}:\n{e}", self.locate(e.input.as_ptr()))
-            }
-            nom::Err::Error(e) => {
-                anyhow!("Parsing error at {}:\n{e}", self.locate(e.input.as_ptr()))
-            }
-        }
+/// `desc` should be a nominal clause, i.e. `parsing`, `template expansion`, etc.
+pub fn wrap_error(
+    assets: &[Asset],
+    error: anyhow::Error,
+    at: *const u8,
+    desc: &str
+) -> anyhow::Error {
+    if let Some((filepath, loc)) = shrimple_parser::utils::locate_in_multiple(
+        at,
+        assets.iter().map(|s| (s.path, s.src().unwrap_or("")))
+    ) {
+        error.context(format!("{desc} error at {}:{}", filepath.display(), loc))
+    } else {
+        error.context(format!("{desc} error at unknown location"))
     }
 }

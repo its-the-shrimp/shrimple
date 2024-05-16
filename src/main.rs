@@ -4,11 +4,11 @@ mod parser;
 mod utils;
 mod mime;
 mod escape_html;
+mod error;
 
-use crate::utils::{PathBufExt, Result};
+use crate::{evaluator::eval, utils::{PathBufExt, Result}};
 use anyhow::Context;
 use clap::Parser;
-use evaluator::Evaluator;
 use notify::{recommended_watcher, Config, RecursiveMode::Recursive, Watcher};
 use shrimple_localhost::{print_request_result, Server, ServerError};
 use std::{env::set_current_dir, path::PathBuf, sync::atomic::{AtomicBool, Ordering}};
@@ -48,7 +48,7 @@ fn main() -> Result {
     let root = abs_file.parent().context("invalid source file")?;
     set_current_dir(root)?;
     if !args.watch {
-        return Evaluator::default().eval_all(&abs_file, root, output)
+        return eval(&abs_file, root, output)
     }
 
     let port = args.port.unwrap_or(Server::DEFAULT_PORT);
@@ -56,7 +56,7 @@ fn main() -> Result {
 
     let mut watcher = recommended_watcher(move |event: notify::Result<notify::Event>| match event {
         Ok(event) => if event.paths.iter().any(|p| !p.starts_with(output)) {
-            RECOMPILE.store(true, Ordering::Relaxed)
+            RECOMPILE.store(true, Ordering::Relaxed);
         }
         Err(err) => eprintln!("Error in the filesystem watcher:\n{err}"),
     }).context("failed to configure the filesystem watcher")?;
@@ -74,7 +74,7 @@ fn main() -> Result {
                     return Ok(())
                 }
                 println!("Change detected, rebuilding website...");
-                Evaluator::default().eval_all(&abs_file, root, output)
+                eval(&abs_file, root, output)
             },
             |addr, res| Ok(print_request_result(addr, res)),
         ).unwrap_err();

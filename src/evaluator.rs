@@ -1,10 +1,11 @@
-use anyhow::{bail, ensure, Context};
+use anyhow::{bail, ensure, Context, Error};
 use mlua::Value::Nil;
 use mlua::{FromLua, Integer, Lua, Value};
+use shrimple_parser::utils::{locate, locate_saturating, FullLocation, Location};
 use ureq::Agent;
 use std::borrow::Cow;
 use std::ffi::OsStr;
-use std::fmt::{self, Display, Formatter, Write};
+use std::fmt::{Display, Write};
 use std::fs::{create_dir, create_dir_all, read_dir, remove_file, write, ReadDir};
 use std::io;
 use std::mem::take;
@@ -12,33 +13,19 @@ use std::path::Path;
 use std::ptr::null;
 use DoubleEndedIterator as Reversible;
 
-use crate::asset::{ptr_to_loc, Asset, AssetState};
+use crate::asset::{wrap_error, Asset, AssetState};
+use crate::error::{collect_template_expansion_info, Expansions, ExtraCtx};
 use crate::mime::remote_file_ext;
-use crate::parser::{url_scheme, Attr, AttrValue, ShrimpleParser};
+use crate::parser::{url_scheme, Attr, AttrValue, EvalCmd, ShrimpleParser};
 use crate::short_str;
 use crate::utils::{
     assume_static, assume_static_mut, default, os_str, soft_link, OptionExt, Prefixed, Result, ShortStr
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EvalCmd {
-    AdvanceIter,
-    EndExpansion,
-}
+type XmlFragment = crate::parser::XmlFragment<'static>;
 
-impl Display for EvalCmd {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AdvanceIter => write!(f, "$[__advanceIter]"),
-            Self::EndExpansion => write!(f, "$[__endExpansion]"),
-        }
-    }
-}
-
-type XmlFragment = crate::parser::XmlFragment<'static, EvalCmd>;
-
-pub trait StrLike<'src>: PartialEq<&'src str> + Display {}
-impl<'src, T: PartialEq<&'src str> + Display> StrLike<'src> for T {}
+pub trait StrLike<'src>: PartialEq<&'src str> + Display + Copy {}
+impl<'src, T: PartialEq<&'src str> + Display + Copy> StrLike<'src> for T {}
 
 // TODO: replace the traits above with the following when trait aliases are stabilised:
 //
@@ -47,7 +34,7 @@ impl<'src, T: PartialEq<&'src str> + Display> StrLike<'src> for T {}
 
 /// The parser + a queue for tokens to be fetched before progressing the parser
 struct EvalCtx {
-    parser: ShrimpleParser<EvalCmd>,
+    parser: ShrimpleParser,
     queue: Vec<XmlFragment>,
     /// Last fragment fetched from the queue
     last: Option<XmlFragment>,
@@ -72,21 +59,32 @@ impl Iterator for EvalCtx {
 impl EvalCtx {
     fn process<R>(
         src: &'static str,
-        r: Asset,
+        asset: Asset,
         f: impl FnOnce(&mut Self) -> Result<R>,
     ) -> Result<R> {
         let mut ctx = Self {
-            parser: ShrimpleParser::new(src, r),
+            parser: ShrimpleParser::new(src, asset),
             queue: vec![],
             expansions: vec![],
             iterators: vec![],
             last: None,
         };
         let res = f(&mut ctx);
-        ctx.parser.finish().and(res.map_err(|e| Self::wrap_error(e, *ctx.file(), ctx.last)))
+        let res = ctx.parser.finish().map_err(Error::new).and(res);
+        let res = res.with_context(|| {
+            Expansions(ctx.expansions.into_iter().map(|e| e.name).collect::<Vec<_>>().into())
+        });
+        match (res, ctx.last, asset.src()) {
+            (Err(err), Some(f), Some(src)) => if let Some(loc) = locate(f.as_src_ptr(), src) {
+                Err(err.context(ExtraCtx(FullLocation { loc, path: asset.path })))
+            } else {
+                Err(err)
+            }
+            (res, ..) => res,
+        }
     }
 
-    fn file(&self) -> &Asset {
+    const fn file(&self) -> &Asset {
         self.parser.file()
     }
 
@@ -95,9 +93,9 @@ impl EvalCtx {
     fn format_str(
         &mut self,
         src: &'static str,
-        f: impl FnOnce(&mut EvalCtx, &mut String) -> Result,
+        f: impl FnOnce(&mut Self, &mut String) -> Result,
     ) -> Result<Cow<'static, str>> {
-        EvalCtx::process(src, *self.file(), |ctx| {
+        Self::process(src, *self.file(), |ctx| {
             match ctx.parser.next() {
                 None => return Ok(src.into()),
                 Some(XmlFragment::Text(t)) if t.len() == src.len() => return Ok(src.into()),
@@ -109,20 +107,8 @@ impl EvalCtx {
     }
 
     /// Guarantees to not change `self.iterators` or `self.expansions`
-    fn enqueue<T>(&mut self, tokens: T)
-    where
-        T: IntoIterator<Item = XmlFragment>,
-        T::IntoIter: Reversible,
-    {
-        self.queue.extend(tokens.into_iter().rev())
-    }
-    // TODO: uncomment in 1.79.0
-    //fn enqueue(&mut self, tokens: impl IntoIterator<Item = XmlFragment, IntoIter: Reversible>) {
-    //    self.queue.extend(tokens.into_iter().rev())
-    //}
-
-    fn wrap_error(error: anyhow::Error, r: Asset, at: Option<XmlFragment>) -> anyhow::Error {
-        r.wrap(error, at.map_or(null(), |f| f.as_src_ptr()), "template expansion")
+    fn enqueue(&mut self, tokens: impl IntoIterator<IntoIter = impl Reversible<Item = XmlFragment>>) {
+        self.queue.extend(tokens.into_iter().rev());
     }
 
     fn end_expansion(&mut self) -> Result {
@@ -142,9 +128,10 @@ struct Template {
     accepts_children: bool,
 }
 
+#[derive(Debug)]
 struct Expansion {
-    /// index in the evaluator's `templates`
-    index: usize,
+    /// For error reporting purposes, the string's from the call site of the template.
+    name: &'static str,
     children: Option<Box<[XmlFragment]>>,
 }
 
@@ -154,7 +141,7 @@ struct IterCtx {
     iter: ReadDir,
 }
 
-pub struct Evaluator {
+struct Evaluator {
     templates: Vec<Template>,
     lua_ctx: Lua,
     processed_exts: Vec<&'static OsStr>,
@@ -178,8 +165,15 @@ impl Default for Evaluator {
 /// the parser must be at the state of "<templateName....
 ///                                                  ^
 impl Evaluator {
-    fn get_lua_var(&self, name: &str) -> Result<String> {
-        Ok(self.lua_ctx.globals().get(name)?)
+    fn locate(&self, ptr: *const u8) -> Option<(&'static Path, Location)> {
+        shrimple_parser::utils::locate_in_multiple(
+            ptr,
+            self.assets.iter().map(|a| (a.path, a.src().unwrap_or(""))),
+        )
+    }
+    
+    fn get_lua_var(&self, name: &str) -> mlua::Result<String> {
+        self.lua_ctx.globals().get(name)
     }
 
     fn set_lua_var(&self, name: &str, value: &str) -> mlua::Result<()> {
@@ -205,18 +199,18 @@ impl Evaluator {
         Ok(())
     }
 
-    fn eval_lua(&self, code: &str, file: Asset) -> Result<String> {
-        Ok(match self.lua_ctx.load(code).set_name(file.locate(code.as_ptr())).eval()? {
-            Value::Nil => String::new(),
-            Value::Number(n) => {
-                if n.is_finite() && n == n.trunc() {
-                    (n as u64).to_string()
-                } else {
-                    n.to_string()
-                }
-            }
-            res => String::from_lua(res, &self.lua_ctx)?,
-        })
+    fn eval_lua(&self, code: &str) -> mlua::Result<String> {
+        let name = if let Some((path, loc)) = self.locate(code.as_ptr()) {
+            format!("{}:{loc}", path.display())    
+        } else {
+            "<unknown>".to_owned()
+        };
+
+        match self.lua_ctx.load(code).set_name(name).eval()? {
+            Value::Nil => Ok(default()),
+            Value::Number(n) => Ok(n.to_string()),
+            res => String::from_lua(res, &self.lua_ctx),
+        }
     }
 
     fn eval_attr_value(
@@ -224,22 +218,22 @@ impl Evaluator {
         value: &AttrValue<'static>,
         ctx: &mut EvalCtx,
     ) -> Result<Option<Cow<'static, str>>> {
-        Ok(match *value {
-            AttrValue::None => None,
-            AttrValue::Var(var) => Some(self.get_lua_var(var)?.into()),
-            AttrValue::Expr(code) => Some(self.eval_lua(code, *ctx.file())?.into()),
-            AttrValue::Text(text) => {
-                let res: Cow<'static, str> = ctx.format_str(
-                    text,
-                    |q, dst| self.eval(q, dst)
-                )?;
-                Some(res)
-            }
-        })
+        Ok(Some(match *value {
+            AttrValue::None => return Ok(None),
+            AttrValue::Var(var) => self.get_lua_var(var)?.into(),
+            AttrValue::Expr(code) => self.eval_lua(code)?.into(),
+            AttrValue::Text(text) => ctx.format_str(
+                text,
+                |q, dst| self.eval(q, dst).map_err(|e| {
+                    let at = q.last.map_or(null(), |f| f.as_src_ptr());
+                    wrap_error(&self.assets, e, at, "string interpolation")
+                })
+            )?,
+        }))
     }
 
-    fn add_asset(&mut self, r: Asset) -> Result<usize> {
-        Ok(if let Some(id) = self.assets.iter_mut().position(|r2| r2.path == r.path) {
+    fn add_asset(&mut self, r: Asset) -> usize {
+        if let Some(id) = self.assets.iter_mut().position(|r2| r2.path == r.path) {
             let existing = &mut self.assets[id];
             if existing.state == AssetState::Raw && r.state != AssetState::Raw {
                 existing.state = r.state;
@@ -249,25 +243,22 @@ impl Evaluator {
             let id = self.assets.len();
             self.assets.push(r);
             id
-        })
+        }
     }
 
     /// the return values are:
     /// (the index of the asset, the file extension of the asset)
     fn cache_remote_asset(&mut self, url: &str) -> Result<(usize, ShortStr)> {
         match url_scheme(url) {
-            Some("http") | Some("https") => {
+            Some("http" | "https") => {
                 let response = self.http_client.get(url).call()
                     .with_context(|| format!("failed to fetch {url:?}"))?;
                 let ext = remote_file_ext(&response)
                     .with_context(|| format!("unable to infer the file type \
-                                              of the URL {url:?}"))?
-                    .to_owned();
+                                              of the URL {url:?}"))?;
                 let mut content = vec![];
                 response.into_reader().read_to_end(&mut content)?;
-                let id = self.add_asset(
-                    Asset::new_cached(url, content.leak(), ext)
-                )?;
+                let id = self.add_asset(Asset::new_cached(url, content.leak(), ext));
                 Ok((id, ext))
             }
             Some(s) => {
@@ -293,9 +284,8 @@ impl Evaluator {
                 XmlFragment::ClosingTag(t) if tag_name == t => {
                     if nesting == 0 {
                         return Ok(());
-                    } else {
-                        nesting -= 1
-                    }
+                    } 
+                    nesting -= 1;
                 }
                 _ => (),
             }
@@ -377,7 +367,7 @@ impl Evaluator {
             self.set_lua_var(name, buf.as_str())?;
         } else {
             self.set_lua_var(name, &path)?;
-            self.add_asset(Asset::new(&*path, needs_processing, &self.processed_exts)?)?;
+            self.add_asset(Asset::new(&*path, needs_processing, &self.processed_exts)?);
         }
         Ok(())
     }
@@ -390,7 +380,7 @@ impl Evaluator {
             None => bail!("expected `>`, instead got EOF"),
             _ => bail!("unexpected input"),
         }
-        dst.write_str(&self.eval_lua(&Self::collect_inner_xml("$lua", ctx)?, *ctx.file())?)?;
+        dst.write_str(&self.eval_lua(&Self::collect_inner_xml("$lua", ctx)?)?)?;
         Ok(())
     }
 
@@ -405,7 +395,7 @@ impl Evaluator {
                 Some(XmlFragment::Attr(attr)) => match attr.name() {
                     "acceptsChildren" => {
                         ensure!(!attr.has_value(), "`acceptsChildren` must have no value");
-                        accepts_children = true
+                        accepts_children = true;
                     }
 
                     "name" => match attr.value {
@@ -423,7 +413,7 @@ impl Evaluator {
                         attrs.push(TemplateAttr {
                             name,
                             default: self.eval_attr_value(&attr.value, ctx)?,
-                        })
+                        });
                     }
                 }
 
@@ -447,6 +437,7 @@ impl Evaluator {
     }
 
     /// paste children passed to the invocation of the currently expanded template
+    #[allow(clippy::unused_self, /* reason="consistency with other template handlers" */)]
     fn handle_children_template(&mut self, ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
         let raw = match ctx.next() {
             Some(XmlFragment::OpeningTagEnd(t)) if t.is_self_closing() => false,
@@ -462,21 +453,20 @@ impl Evaluator {
             _ => bail!("unexpected input"),
         };
 
-        let Some(Expansion { index, children }) = ctx.expansions.last() else {
+        let Some(Expansion { children, name, .. }) = ctx.expansions.last() else {
             bail!("`$children` can only be used in the children of a template declaraion")
         };
         let Some(children) = children else {
-            let name = self.templates[*index].name;
             bail!("`${name}` doesn't accept children so `$children` can't be used in it")
         };
 
         if raw {
             for frag in &**children {
-                write!(dst, "{frag:#}")?
+                write!(dst, "{frag:#}")?;
             }
         } else {
             // Safety: per `IterCtx::enqueue`, `ctx.expansions` won't be changed
-            ctx.enqueue(unsafe {assume_static(children)}.iter().copied())
+            ctx.enqueue(unsafe {assume_static(children)}.iter().copied());
         }
         Ok(())
     }
@@ -563,6 +553,7 @@ impl Evaluator {
         Ok(())
     }
 
+    #[allow(clippy::unused_self, /* reason="consistency with other template handlers" */)]
     fn handle_raw_template(&mut self, mut ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
         let element_name = match ctx.next() {
             Some(XmlFragment::Attr(attr)) if !attr.has_value() => {
@@ -588,7 +579,7 @@ impl Evaluator {
         };
         Self::for_each_inner_xml("$raw", ctx, |frag| Ok(write!(dst, "{frag:#}")?))?;
         if let Some(element_name) = element_name {
-            write!(dst, "</{element_name}>")?
+            write!(dst, "</{element_name}>")?;
         }
         Ok(())
     }
@@ -628,7 +619,7 @@ impl Evaluator {
                         self.set_lua_var(attr.name, value)?;
                     }
                     let expansion = if t.is_self_closing() {
-                        Expansion { index, children: accepts_children.then(default) }
+                        Expansion { name, children: accepts_children.then(default) }
                     } else {
                         ensure!(accepts_children, "`${name}` doesn't accept children");
                         let mut can_recurse = false;
@@ -647,10 +638,7 @@ impl Evaluator {
                                    as it'd lead to infinite recursion")
                         }
 
-                        Expansion {
-                            index,
-                            children: children.into_boxed_slice().into(),
-                        }
+                        Expansion { name, children: children.into_boxed_slice().into() }
                     };
                     ctx.expansions.push(expansion);
                     break;
@@ -700,19 +688,18 @@ impl Evaluator {
 
                     match (ref_attrs.contains(&attr_name), take(&mut cached)) {
                         (true, true) => match url_scheme(&value) { // ref attr, cached
-                            Some("http") | Some("https") => {
+                            Some("http" | "https") => {
                                 let response = self.http_client.get(&value).call()
                                     .with_context(|| format!("failed to fetch {value:?}"))?;
                                 let ext = remote_file_ext(&response)
                                     .with_context(|| format!("unable to infer the file type \
-                                                              of the URL {value:?}"))?
-                                    .to_owned();
+                                                              of the URL {value:?}"))?;
                                 let mut content = vec![];
                                 response.into_reader().read_to_end(&mut content)?;
                                 let id = self.add_asset(
                                     Asset::new_cached(value, content.leak(), ext)
-                                )?;
-                                write!(dst, "=\"/cached/{id}{ext}\"")?
+                                );
+                                write!(dst, "=\"/cached/{id}{ext}\"")?;
                             }
                             Some(s) => {
                                 bail!("unable to cache, unknown URI scheme: {s:?}\n\
@@ -727,10 +714,10 @@ impl Evaluator {
                         (true, false) => { // ref attr, not cached
                             let value = value.trim_start_matches('/');
                             if !value.is_empty() && url_scheme(value).is_none() {
-                                self.add_asset(Asset::new(value, None, &self.processed_exts)?)?;
-                                write!(dst, "=\"/{value}\"")?
+                                self.add_asset(Asset::new(value, None, &self.processed_exts)?);
+                                write!(dst, "=\"/{value}\"")?;
                             } else {
-                                write!(dst, "=\"{value}\"")?
+                                write!(dst, "=\"{value}\"")?;
                             }
                         }
 
@@ -744,7 +731,7 @@ impl Evaluator {
                             if attr_name.starts_with('$') {
                                 bail!("unknown special attribute: {attr_name:?}")
                             }
-                            write!(dst, "=\"{value}\"")?
+                            write!(dst, "=\"{value}\"")?;
                         }
                     }
                 }
@@ -752,7 +739,7 @@ impl Evaluator {
                 XmlFragment::OpeningTagEnd(t) => {
                     match (IS_VOID, t.is_self_closing()) {
                         (true, true) => dst.write_char('>')?,
-                        (true, false) => bail!("element {name} must be self-closing"),
+                        (true, false) => bail!("element `<{name}>` must be self-closing"),
                         (false, true) => write!(dst, "></{name}>")?,
                         (false, false) => {
                             dst.write_char('>')?;
@@ -780,7 +767,7 @@ impl Evaluator {
         self._handle_element::<false>(name, ctx, dst, ref_attrs, tag_stack)
     }
 
-    /// https://developer.mozilla.org/en-US/docs/Glossary/Void_element
+    /// <https://developer.mozilla.org/en-US/docs/Glossary/Void_element>
     fn handle_void_element(
         &mut self,
         name: &'static str,
@@ -833,12 +820,12 @@ impl Evaluator {
                         Some(name) => bail!("expected `</{name}>`, instead got `</{tag_name}>`"),
                         None => bail!("unmatched closing tag"),
                     }
-                    write!(dst, "</{tag_name}>")?
+                    write!(dst, "</{tag_name}>")?;
                 }
 
                 XmlFragment::Var(name) => dst.write_str(&self.get_lua_var(name)?)?,
 
-                XmlFragment::Expr(code) => dst.write_str(&self.eval_lua(code, *ctx.file())?)?,
+                XmlFragment::Expr(code) => dst.write_str(&self.eval_lua(code)?)?,
 
                 XmlFragment::Text(text) => dst.write_str(text)?,
 
@@ -855,8 +842,7 @@ impl Evaluator {
             let mut err_msg = "unclosed elements present:\n".to_owned();
             let src = ctx.parser.file().src().context("internal bug: no source code found")?;
             for tag in tag_stack {
-                let [line, col] = ptr_to_loc(src, tag.as_ptr().wrapping_sub(1));
-                writeln!(err_msg, "\t{tag:?} at {line}:{col}")?;
+                writeln!(err_msg, "\t{tag:?} at {}", locate_saturating(tag.as_ptr(), src))?;
             }
             bail!(err_msg)
         }
@@ -871,22 +857,21 @@ impl Evaluator {
     }
 
     pub fn eval_all(
-        mut self,
+        &mut self,
         src: impl AsRef<Path>,
         root: impl AsRef<Path>,
         dst: impl AsRef<Path>,
     ) -> Result {
         let src_root = root.as_ref();
         let mut dst_root = dst.as_ref().to_owned();
-        self.add_asset(Asset::new_template(src)?)?;
+        self.add_asset(Asset::new_template(src)?);
         let mut dst = String::new();
 
         while let Some((src, file)) =
             self.assets.iter_mut().find_map(|x| x.src_for_processing().map(|s| (s, *x)))
         {
             dst.clear();
-            EvalCtx::process(src, file, |ctx| self.eval_file(ctx, &mut dst))
-                .with_context(|| format!("failed to evaluate templates in {:?}", file.path))?;
+            EvalCtx::process(src, file, |ctx| self.eval_file(ctx, &mut dst))?;
             let dst_path = dst_root.join(file.path.strip_prefix(src_root)?);
             dst_path.parent().try_map(create_dir_all)?;
             write(&dst_path, &dst).with_context(|| format!("failed to write to {dst_path:?}"))?;
@@ -900,7 +885,7 @@ impl Evaluator {
                     if let Err(err) = soft_link(src, &dst) {
                         if err.kind() == io::ErrorKind::AlreadyExists {
                             remove_file(&dst).with_context(|| format!("failed to remove {dst:?}"))?;
-                            soft_link(src, &dst)?
+                            soft_link(src, &dst)?;
                         } else {
                             bail!("failed to create a link from {src:?} to {dst:?}:\n\t{err}")
                         }
@@ -931,4 +916,16 @@ impl Evaluator {
 
         Ok(())
     }
+}
+
+pub fn eval(
+    src: impl AsRef<Path>,
+    root: impl AsRef<Path>,
+    dst: impl AsRef<Path>,
+) -> Result {
+    let mut evaluator = Evaluator::default();
+    evaluator.eval_all(src, root, dst).map_err(|e| collect_template_expansion_info(
+        e,
+        evaluator.assets.iter().map(|a| (a.path, a.src().unwrap_or("")))
+    ))
 }

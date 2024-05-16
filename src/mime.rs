@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
+use shrimple_parser::tuple::first;
 use ureq::Response;
-use crate::utils::{first, ShortStr};
+use crate::utils::ShortStr;
 use crate::short_str;
 
 macro_rules! define_mime_to_ext {

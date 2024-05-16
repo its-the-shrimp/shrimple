@@ -304,12 +304,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "523dc4f511e55ab87b694dc30d0f820d60906ef06413f93d4d7a1385599cc149"
 
 [[package]]
-name = "minimal-lexical"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
-
-[[package]]
 name = "miniz_oxide"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -352,16 +346,6 @@ dependencies = [
  "cc",
  "cfg-if",
  "pkg-config",
-]
-
-[[package]]
-name = "nom"
-version = "7.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
-dependencies = [
- "memchr",
- "minimal-lexical",
 ]
 
 [[package]]
@@ -525,9 +509,9 @@ dependencies = [
  "anyhow",
  "clap",
  "mlua",
- "nom",
  "notify",
  "shrimple-localhost",
+ "shrimple-parser",
  "ureq",
 ]
 
@@ -536,6 +520,12 @@ name = "shrimple-localhost"
 version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eba3a3ef4fc1d9b93de19e773e8bce6fa33ad1da6dffdca957e79d368528ca8c"
+
+[[package]]
+name = "shrimple-parser"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd002c1eeb3b7976bf53bd89fe6df1de599925b787c308722d466a845214fb3e"
 
 [[package]]
 name = "spin"

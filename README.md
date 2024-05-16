@@ -8,7 +8,7 @@ cargo install shrimple
 ### 1. Keep it shrimple
 No external configuration needed: you have HTML, you have `shrimple`, you call it, and get a site ready to be deployed.
 ```console
-shrimple -o dist index.html
+shrimple
 ```
 This will build the website with `index.html` as its root and paste the root and all the files it references into `dist`
 ### 2. Compute anything anywhere with Lua

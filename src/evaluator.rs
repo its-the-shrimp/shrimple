@@ -2,7 +2,6 @@ use anyhow::{bail, ensure, Context, Error};
 use mlua::Value::Nil;
 use mlua::{FromLua, Integer, Lua, Value};
 use shrimple_parser::utils::{locate, locate_saturating, FullLocation, Location};
-use ureq::Agent;
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::fmt::{Display, Write};
@@ -11,6 +10,7 @@ use std::io;
 use std::mem::take;
 use std::path::Path;
 use std::ptr::null;
+use ureq::Agent;
 use DoubleEndedIterator as Reversible;
 
 use crate::asset::{wrap_error, Asset, AssetState};
@@ -19,7 +19,8 @@ use crate::mime::remote_file_ext;
 use crate::parser::{url_scheme, Attr, AttrValue, EvalCmd, ShrimpleParser};
 use crate::short_str;
 use crate::utils::{
-    assume_static, assume_static_mut, default, os_str, soft_link, OptionExt, Prefixed, Result, ShortStr
+    assume_static, assume_static_mut, default, os_str, soft_link, OptionExt, Prefixed, Result,
+    ShortStr,
 };
 
 type XmlFragment = crate::parser::XmlFragment<'static>;
@@ -75,10 +76,12 @@ impl EvalCtx {
             Expansions(ctx.expansions.into_iter().map(|e| e.name).collect::<Vec<_>>().into())
         });
         match (res, ctx.last, asset.src()) {
-            (Err(err), Some(f), Some(src)) => if let Some(loc) = locate(f.as_src_ptr(), src) {
-                Err(err.context(ExtraCtx(FullLocation { loc, path: asset.path })))
-            } else {
-                Err(err)
+            (Err(err), Some(f), Some(src)) => {
+                if let Some(loc) = locate(f.as_src_ptr(), src) {
+                    Err(err.context(ExtraCtx(FullLocation { loc, path: asset.path })))
+                } else {
+                    Err(err)
+                }
             }
             (res, ..) => res,
         }
@@ -107,7 +110,10 @@ impl EvalCtx {
     }
 
     /// Guarantees to not change `self.iterators` or `self.expansions`
-    fn enqueue(&mut self, tokens: impl IntoIterator<IntoIter = impl Reversible<Item = XmlFragment>>) {
+    fn enqueue(
+        &mut self,
+        tokens: impl IntoIterator<IntoIter = impl Reversible<Item = XmlFragment>>,
+    ) {
         self.queue.extend(tokens.into_iter().rev());
     }
 
@@ -171,7 +177,7 @@ impl Evaluator {
             self.assets.iter().map(|a| (a.path, a.src().unwrap_or(""))),
         )
     }
-    
+
     fn get_lua_var(&self, name: &str) -> mlua::Result<String> {
         self.lua_ctx.globals().get(name)
     }
@@ -201,7 +207,7 @@ impl Evaluator {
 
     fn eval_lua(&self, code: &str) -> mlua::Result<String> {
         let name = if let Some((path, loc)) = self.locate(code.as_ptr()) {
-            format!("{}:{loc}", path.display())    
+            format!("{}:{loc}", path.display())
         } else {
             "<unknown>".to_owned()
         };
@@ -222,13 +228,12 @@ impl Evaluator {
             AttrValue::None => return Ok(None),
             AttrValue::Var(var) => self.get_lua_var(var)?.into(),
             AttrValue::Expr(code) => self.eval_lua(code)?.into(),
-            AttrValue::Text(text) => ctx.format_str(
-                text,
-                |q, dst| self.eval(q, dst).map_err(|e| {
+            AttrValue::Text(text) => ctx.format_str(text, |q, dst| {
+                self.eval(q, dst).map_err(|e| {
                     let at = q.last.map_or(null(), |f| f.as_src_ptr());
                     wrap_error(&self.assets, e, at, "string interpolation")
                 })
-            )?,
+            })?,
         }))
     }
 
@@ -251,23 +256,33 @@ impl Evaluator {
     fn cache_remote_asset(&mut self, url: &str) -> Result<(usize, ShortStr)> {
         match url_scheme(url) {
             Some("http" | "https") => {
-                let response = self.http_client.get(url).call()
+                let response = self
+                    .http_client
+                    .get(url)
+                    .call()
                     .with_context(|| format!("failed to fetch {url:?}"))?;
-                let ext = remote_file_ext(&response)
-                    .with_context(|| format!("unable to infer the file type \
-                                              of the URL {url:?}"))?;
+                let ext = remote_file_ext(&response).with_context(|| {
+                    format!(
+                        "unable to infer the file type \
+                                              of the URL {url:?}"
+                    )
+                })?;
                 let mut content = vec![];
                 response.into_reader().read_to_end(&mut content)?;
                 let id = self.add_asset(Asset::new_cached(url, content.leak(), ext));
                 Ok((id, ext))
             }
             Some(s) => {
-                bail!("unable to cache, unknown URI scheme: {s:?}\n\
-                       \tthe full URI is {url:?}")
+                bail!(
+                    "unable to cache, unknown URI scheme: {s:?}\n\
+                       \tthe full URI is {url:?}"
+                )
             }
             None => {
-                bail!("`$cached` can only be applied to remote assets\n\
-                       \tthe full URI is {url:?}")
+                bail!(
+                    "`$cached` can only be applied to remote assets\n\
+                       \tthe full URI is {url:?}"
+                )
             }
         }
     }
@@ -284,7 +299,7 @@ impl Evaluator {
                 XmlFragment::ClosingTag(t) if tag_name == t => {
                     if nesting == 0 {
                         return Ok(());
-                    } 
+                    }
                     nesting -= 1;
                 }
                 _ => (),
@@ -315,10 +330,12 @@ impl Evaluator {
         mut f: impl FnMut(&XmlFragment),
     ) -> Result<Vec<XmlFragment>> {
         let mut res = vec![];
-        Self::for_each_inner_xml(tag_name, ctx, |frag| Ok({
-            f(&frag);
-            res.push(frag);
-        }))?;
+        Self::for_each_inner_xml(tag_name, ctx, |frag| {
+            Ok({
+                f(&frag);
+                res.push(frag);
+            })
+        })?;
         Ok(res)
     }
 
@@ -404,7 +421,7 @@ impl Evaluator {
                             bail!("template name can only be a literal")
                         }
                         AttrValue::Text(text) => name = Some(text),
-                    }
+                    },
 
                     name => {
                         let Some(name) = name.strip_prefix('$') else {
@@ -415,7 +432,7 @@ impl Evaluator {
                             default: self.eval_attr_value(&attr.value, ctx)?,
                         });
                     }
-                }
+                },
 
                 Some(XmlFragment::OpeningTagEnd(t)) if t.is_self_closing() => break default(),
 
@@ -466,14 +483,15 @@ impl Evaluator {
             }
         } else {
             // Safety: per `IterCtx::enqueue`, `ctx.expansions` won't be changed
-            ctx.enqueue(unsafe {assume_static(children)}.iter().copied());
+            ctx.enqueue(unsafe { assume_static(children) }.iter().copied());
         }
         Ok(())
     }
 
     fn handle_foreach_template(&mut self, ctx: &mut EvalCtx) -> Result {
         let var_name = match ctx.next() {
-            Some(XmlFragment::Attr(attr)) if !attr.has_value() => attr.name()
+            Some(XmlFragment::Attr(attr)) if !attr.has_value() => attr
+                .name()
                 .strip_prefix('$')
                 .context("name of the declared variable must be prefixed with `$`")?,
             Some(XmlFragment::Attr(_)) => bail!("extraneous `=...`"),
@@ -515,7 +533,7 @@ impl Evaluator {
             Some(XmlFragment::Attr(_)) => {
                 bail!("the argument must be the file extension without the dot, remove `=...`")
             }
-            _ => bail!("expected file extension")
+            _ => bail!("expected file extension"),
         };
         if ext.starts_with('.') {
             bail!("the file extension must not start with a dot")
@@ -562,13 +580,15 @@ impl Evaluator {
                 for frag in &mut ctx {
                     write!(dst, "{frag}")?;
                     if matches!(frag, XmlFragment::OpeningTagEnd(_)) {
-                        break
+                        break;
                     }
                 }
                 Some(name)
             }
-            Some(XmlFragment::Attr(_)) => bail!("element name is an attribute without value\n\
-                                                remove the `=...`"),
+            Some(XmlFragment::Attr(_)) => bail!(
+                "element name is an attribute without value\n\
+                                                remove the `=...`"
+            ),
             Some(XmlFragment::OpeningTagEnd(a)) if a.is_self_closing() => return Ok(()),
             Some(XmlFragment::OpeningTagEnd(_)) => {
                 dst.write_char('>')?;
@@ -626,16 +646,20 @@ impl Evaluator {
                         let children = Self::collect_inner_xml_fragments_and_inspect(
                             Prefixed::<'$', _>(name),
                             ctx,
-                            |f| can_recurse = match f {
-                                XmlFragment::OpeningTagStart("$children") => true,
-                                XmlFragment::ClosingTag("$template") => false,
-                                _ => return,
-                            }
+                            |f| {
+                                can_recurse = match f {
+                                    XmlFragment::OpeningTagStart("$children") => true,
+                                    XmlFragment::ClosingTag("$template") => false,
+                                    _ => return,
+                                }
+                            },
                         )?;
                         if can_recurse {
                             // TODO: report the location of this error
-                            bail!("using `<$children>` in template children is disallowed \
-                                   as it'd lead to infinite recursion")
+                            bail!(
+                                "using `<$children>` in template children is disallowed \
+                                   as it'd lead to infinite recursion"
+                            )
                         }
 
                         Expansion { name, children: children.into_boxed_slice().into() }
@@ -687,31 +711,42 @@ impl Evaluator {
                     write!(dst, " {attr_name}")?;
 
                     match (ref_attrs.contains(&attr_name), take(&mut cached)) {
-                        (true, true) => match url_scheme(&value) { // ref attr, cached
+                        (true, true) => match url_scheme(&value) {
+                            // ref attr, cached
                             Some("http" | "https") => {
-                                let response = self.http_client.get(&value).call()
+                                let response = self
+                                    .http_client
+                                    .get(&value)
+                                    .call()
                                     .with_context(|| format!("failed to fetch {value:?}"))?;
-                                let ext = remote_file_ext(&response)
-                                    .with_context(|| format!("unable to infer the file type \
-                                                              of the URL {value:?}"))?;
+                                let ext = remote_file_ext(&response).with_context(|| {
+                                    format!(
+                                        "unable to infer the file type \
+                                                              of the URL {value:?}"
+                                    )
+                                })?;
                                 let mut content = vec![];
                                 response.into_reader().read_to_end(&mut content)?;
-                                let id = self.add_asset(
-                                    Asset::new_cached(value, content.leak(), ext)
-                                );
+                                let id =
+                                    self.add_asset(Asset::new_cached(value, content.leak(), ext));
                                 write!(dst, "=\"/cached/{id}{ext}\"")?;
                             }
                             Some(s) => {
-                                bail!("unable to cache, unknown URI scheme: {s:?}\n\
-                                       \tthe full URI is {value:?}")
+                                bail!(
+                                    "unable to cache, unknown URI scheme: {s:?}\n\
+                                       \tthe full URI is {value:?}"
+                                )
                             }
                             None => {
-                                bail!("`$cached` can only be applied to remote assets\n\
-                                       \tthe full URI is {value:?}")
+                                bail!(
+                                    "`$cached` can only be applied to remote assets\n\
+                                       \tthe full URI is {value:?}"
+                                )
                             }
-                        }
+                        },
 
-                        (true, false) => { // ref attr, not cached
+                        (true, false) => {
+                            // ref attr, not cached
                             let value = value.trim_start_matches('/');
                             if !value.is_empty() && url_scheme(value).is_none() {
                                 self.add_asset(Asset::new(value, None, &self.processed_exts)?);
@@ -721,13 +756,17 @@ impl Evaluator {
                             }
                         }
 
-                        (false, true) => { // not ref attr, cached
-                            bail!("`$cached` can only be applied to a reference attribute\n\
+                        (false, true) => {
+                            // not ref attr, cached
+                            bail!(
+                                "`$cached` can only be applied to a reference attribute\n\
                                    \tmore on reference attributes here: \
-                                   https://github.com/schvv31n/shrimple/wiki/Assets")
+                                   https://github.com/schvv31n/shrimple/wiki/Assets"
+                            )
                         }
 
-                        (false, false) => { // not ref attr, not cached
+                        (false, false) => {
+                            // not ref attr, not cached
                             if attr_name.starts_with('$') {
                                 bail!("unknown special attribute: {attr_name:?}")
                             }
@@ -746,7 +785,7 @@ impl Evaluator {
                             tag_stack.push(name);
                         }
                     }
-                    return Ok(())
+                    return Ok(());
                 }
 
                 _ => bail!("expected attributes, `>` or `/>`"),
@@ -884,7 +923,8 @@ impl Evaluator {
                     dst.parent().try_map(create_dir_all)?;
                     if let Err(err) = soft_link(src, &dst) {
                         if err.kind() == io::ErrorKind::AlreadyExists {
-                            remove_file(&dst).with_context(|| format!("failed to remove {dst:?}"))?;
+                            remove_file(&dst)
+                                .with_context(|| format!("failed to remove {dst:?}"))?;
                             soft_link(src, &dst)?;
                         } else {
                             bail!("failed to create a link from {src:?} to {dst:?}:\n\t{err}")
@@ -892,12 +932,13 @@ impl Evaluator {
                     }
                 }
 
-                AssetState::Cached{content, ext} => {
+                AssetState::Cached { content, ext } => {
                     dst_root.push("cached");
                     match create_dir(&dst_root) {
-                        Err(err) if err.kind() != io::ErrorKind::AlreadyExists =>
-                            bail!("failed to create a directory {dst_root:?}: {err}"),
-                        _ => {},
+                        Err(err) if err.kind() != io::ErrorKind::AlreadyExists => {
+                            bail!("failed to create a directory {dst_root:?}: {err}")
+                        }
+                        _ => {}
                     }
                     let mut num = ShortStr::<32>::default();
                     write!(&mut num, "{id}")?;
@@ -918,14 +959,12 @@ impl Evaluator {
     }
 }
 
-pub fn eval(
-    src: impl AsRef<Path>,
-    root: impl AsRef<Path>,
-    dst: impl AsRef<Path>,
-) -> Result {
+pub fn eval(src: impl AsRef<Path>, root: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result {
     let mut evaluator = Evaluator::default();
-    evaluator.eval_all(src, root, dst).map_err(|e| collect_template_expansion_info(
-        e,
-        evaluator.assets.iter().map(|a| (a.path, a.src().unwrap_or("")))
-    ))
+    evaluator.eval_all(src, root, dst).map_err(|e| {
+        collect_template_expansion_info(
+            e,
+            evaluator.assets.iter().map(|a| (a.path, a.src().unwrap_or(""))),
+        )
+    })
 }

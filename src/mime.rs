@@ -1,8 +1,8 @@
-use anyhow::{Context, Result, bail};
+use crate::short_str;
+use crate::utils::ShortStr;
+use anyhow::{bail, Context, Result};
 use shrimple_parser::tuple::first;
 use ureq::Response;
-use crate::utils::ShortStr;
-use crate::short_str;
 
 macro_rules! define_mime_to_ext {
     {$( $variant_str:literal => $ext:literal ),+ $(,)?} => {
@@ -224,11 +224,10 @@ pub fn remote_file_ext(response: &Response) -> Result<ShortStr> {
     let path = response.get_url();
     if let Some(last_dot) = path.rfind('.') {
         let ext = path.split_at(last_dot).1;
-        ShortStr::new(ext)
-            .with_context(|| format!("file extension too long: {ext:?}"))
+        ShortStr::new(ext).with_context(|| format!("file extension too long: {ext:?}"))
     } else {
-        let content_type = response.header("Content-Type")
-            .context("no Content-Type header provided")?;
+        let content_type =
+            response.header("Content-Type").context("no Content-Type header provided")?;
         mime_to_ext(content_type)
     }
 }

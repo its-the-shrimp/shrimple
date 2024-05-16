@@ -21,7 +21,7 @@ impl<S: AsRef<str>> Display for EscapeHtml<S> {
                 // Safety: we're writing them all anyway, not breaking any UTF-8 sequences.
                 _ => unsafe {
                     f.write_char(char::from_u32_unchecked(byte as u32))?;
-                }
+                },
             }
         }
         Ok(())

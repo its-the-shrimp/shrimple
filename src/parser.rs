@@ -1,14 +1,21 @@
 use shrimple_parser::{
-    from_tuple, parse_char, parse_exact, parse_group, parse_until, parse_until_ex, parse_until_exact, parse_while, tuple::{first, second}, utils::{eq, ne}, FullParsingError, Parser
+    from_tuple, parse_char, parse_exact, parse_group, parse_until, parse_until_ex,
+    parse_until_exact, parse_while,
+    tuple::{first, second},
+    utils::{eq, ne},
+    FullParsingError, Parser,
 };
 
 use crate::{
     asset::Asset,
     escape_html::EscapeHtml,
-    utils::{is_in, Result}
+    utils::{is_in, Result},
 };
 use std::{
-    convert::Infallible, error::Error, fmt::{self, Debug, Display, Formatter}, ptr::null
+    convert::Infallible,
+    error::Error,
+    fmt::{self, Debug, Display, Formatter},
+    ptr::null,
 };
 
 #[derive(Debug, PartialEq, Eq, Default, Clone, Copy)]
@@ -78,7 +85,7 @@ impl<'src> Attr<'src> {
     }
 
     pub fn name(&self) -> &'src str {
-        &self.prefix_and_name[self.name_start ..]
+        &self.prefix_and_name[self.name_start..]
     }
 }
 
@@ -92,7 +99,7 @@ impl Display for OpeningTagEnd<'_> {
             Display::fmt(&EscapeHtml(self.0), f)
         } else {
             Display::fmt(self.0, f)
-        }    
+        }
     }
 }
 
@@ -175,7 +182,7 @@ impl XmlFragment<'_> {
         match self {
             Self::Attr(attr) => attr.as_src_ptr(),
             Self::OpeningTagEnd(tag) => tag.as_src_ptr(),
-            | Self::OpeningTagStart(s)
+            Self::OpeningTagStart(s)
             | Self::ClosingTag(s)
             | Self::Var(s)
             | Self::Expr(s)
@@ -245,16 +252,15 @@ fn parse_template_expr(input: &str) -> ParsingResult<&str> {
 
 fn parse_template_var(input: &str) -> ParsingResult<&str> {
     parse_char('$')
-        .then(parse_while(is_ident_char).filter(ne("")).expect(Expected::TemplateVarName))
-        (input)
+        .then(parse_while(is_ident_char).filter(ne("")).expect(Expected::TemplateVarName))(input)
 }
 
 fn parse_attr_value(input: &str) -> ParsingResult<AttrValue> {
-    parse_template_expr.map(AttrValue::Expr)
+    parse_template_expr
+        .map(AttrValue::Expr)
         .or(parse_template_var.map(AttrValue::Var))
         .or(parse_string_literal.map(AttrValue::Text))
-        .or(parse_word.map(AttrValue::Text))
-        (input)
+        .or(parse_word.map(AttrValue::Text))(input)
 }
 
 fn parse_attr(input: &str) -> ParsingResult<Attr> {
@@ -264,8 +270,7 @@ fn parse_attr(input: &str) -> ParsingResult<Attr> {
         .expect(Expected::AttrName)
         .get_span()
         .add(parse_char('=').then(parse_attr_value).or_value(AttrValue::None))
-        .map(from_tuple!(Attr { name_start, prefix_and_name, value }))
-        (input)
+        .map(from_tuple!(Attr { name_start, prefix_and_name, value }))(input)
 }
 
 /// The output is the element name, without the `<`.
@@ -281,8 +286,7 @@ fn parse_opening_tag_end(input: &str) -> ParsingResult<OpeningTagEnd, Infallible
         .skip(parse_char('>'))
         .get_span()
         .map(second)
-        .map(OpeningTagEnd)
-        (input)
+        .map(OpeningTagEnd)(input)
 }
 
 /// Recoverable if no initial `<!--` is found.
@@ -294,27 +298,25 @@ fn parse_closing_tag(input: &str) -> ParsingResult<&str> {
     parse_exact("</")
         .then(parse_word)
         .maybe_skip(parse_whitespace)
-        .skip(parse_char('>').expect(Expected::ClosedTag))
-        (input)
+        .skip(parse_char('>').expect(Expected::ClosedTag))(input)
 }
 
 fn parse_xml_fragment(input: &str) -> ParsingResult<XmlFragment> {
-    parse_comment.repeat()
-        .then(parse_closing_tag.map(XmlFragment::ClosingTag)
+    parse_comment.repeat().then(
+        parse_closing_tag
+            .map(XmlFragment::ClosingTag)
             .or(parse_opening_tag_start.map(XmlFragment::OpeningTagStart))
             .or(parse_template_expr.map(XmlFragment::Expr))
             .or(parse_template_var.map(XmlFragment::Var))
-            .or(parse_until(is_in(['$', '<']))
-                .map(XmlFragment::Text)
-                .narrow_reason(Expected::Word))
-            .or_map_rest(XmlFragment::Text))
-        (input)
+            .or(parse_until(is_in(['$', '<'])).map(XmlFragment::Text).narrow_reason(Expected::Word))
+            .or_map_rest(XmlFragment::Text),
+    )(input)
 }
 
 fn parse_xml_fragment_in_opening_tag(input: &str) -> ParsingResult<XmlFragment> {
-    parse_opening_tag_end.map(XmlFragment::OpeningTagEnd)
-        .or(parse_attr.map(XmlFragment::Attr))
-        (input)
+    parse_opening_tag_end.map(XmlFragment::OpeningTagEnd).or(parse_attr.map(XmlFragment::Attr))(
+        input,
+    )
 }
 
 pub struct ShrimpleParser {

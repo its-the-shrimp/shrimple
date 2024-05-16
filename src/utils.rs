@@ -3,9 +3,9 @@ use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::fmt::{self, Debug, Display, Formatter, Write};
 use std::mem::transmute;
+use std::path::{Path, PathBuf};
 use std::ptr::copy_nonoverlapping;
 use std::str::from_utf8_unchecked;
-use std::path::{Path, PathBuf};
 
 pub type Result<T = (), E = anyhow::Error> = std::result::Result<T, E>;
 
@@ -144,25 +144,21 @@ impl<const CAP: usize> Write for ShortStr<CAP> {
 
 #[macro_export]
 macro_rules! short_str {
-    ($str:expr) => {
-        {
-            const RES: ShortStr = match ShortStr::new($str) {
-                Some(x) => x,
-                None => panic!("constructing a short string"),
-            };
-            RES
-        }
-    };
+    ($str:expr) => {{
+        const RES: ShortStr = match ShortStr::new($str) {
+            Some(x) => x,
+            None => panic!("constructing a short string"),
+        };
+        RES
+    }};
 
-    ($str:expr, len: $len:literal) => {
-        {
-            const RES: ShortStr<$len> = match ShortStr::<$len>::new($str) {
-                Some(x) => x,
-                None => panic!("constructing a short string"),
-            };
-            RES
-        }
-    };
+    ($str:expr, len: $len:literal) => {{
+        const RES: ShortStr<$len> = match ShortStr::<$len>::new($str) {
+            Some(x) => x,
+            None => panic!("constructing a short string"),
+        };
+        RES
+    }};
 }
 
 impl<const CAP: usize> ShortStr<CAP> {
@@ -170,7 +166,9 @@ impl<const CAP: usize> ShortStr<CAP> {
     #[allow(clippy::cast_possible_truncation, /*reason=" no other sensible way in const fn "*/)]
     pub const fn new(src: &str) -> Option<Self> {
         let len = src.len();
-        if CAP > u8::MAX as usize || len > CAP {return None}
+        if CAP > u8::MAX as usize || len > CAP {
+            return None;
+        }
         let mut buf = [0; CAP];
         let mut i = 0;
         let mut ptr = src.as_ptr();
@@ -183,7 +181,7 @@ impl<const CAP: usize> ShortStr<CAP> {
             }
             i += 1;
         }
-        Some(Self {len: len as u8, buf})
+        Some(Self { len: len as u8, buf })
     }
 
     pub const fn len(&self) -> usize {
@@ -193,7 +191,7 @@ impl<const CAP: usize> ShortStr<CAP> {
     pub const fn as_str(&self) -> &str {
         // SAFETY: `new` & `write_str` are the only functions that modify the string, and they only
         // write `&str`s to it.
-        unsafe {from_utf8_unchecked(slice::from_raw_parts(self.buf.as_ptr(), self.len as usize))}
+        unsafe { from_utf8_unchecked(slice::from_raw_parts(self.buf.as_ptr(), self.len as usize)) }
     }
 }
 

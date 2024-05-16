@@ -1,7 +1,14 @@
-use std::{fmt::{Debug, Display, Formatter, Write}, path::Path, sync::Arc};
-use anyhow::Error;
-use shrimple_parser::{utils::{locate_in_multiple, FullLocation, WithSourceLine}, FullParsingError};
 use crate::parser::Expected;
+use anyhow::Error;
+use shrimple_parser::{
+    utils::{locate_in_multiple, FullLocation, WithSourceLine},
+    FullParsingError,
+};
+use std::{
+    fmt::{Debug, Display, Formatter, Write},
+    path::Path,
+    sync::Arc,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ExtraCtx<T>(pub T);
@@ -22,13 +29,13 @@ pub struct Expansions(pub Arc<[&'static str]>);
 impl Display for Expansions {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "<not an error, but Expansions>")
-    }   
+    }
 }
 
 impl std::error::Error for Expansions {}
 
 pub fn collect_template_expansion_info<Files, Filepath, Src>(error: Error, files: Files) -> Error
-where 
+where
     Files: IntoIterator,
     Files::IntoIter: Iterator<Item = (Filepath, Src)> + Clone,
     Filepath: AsRef<Path>,
@@ -45,12 +52,9 @@ where
             err.reason.map_or_else(|| "\rthis is a bug :3".to_owned(), |x| format!("\rerror: {x}")),
             Some(err.loc),
         ),
-        None => (
-            format!("\rerror: {root}"),
-            loc
-        ),
+        None => (format!("\rerror: {root}"), loc),
     };
-    
+
     if let Some(loc) = loc {
         if write!(&mut msg, "\n--> {}", WithSourceLine(loc)).is_err() {
             return error;

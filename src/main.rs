@@ -8,7 +8,7 @@ mod utils;
 
 use crate::{
     evaluator::eval,
-    utils::{PathBufExt, Result},
+    utils::Result,
 };
 use anyhow::Context;
 use clap::Parser;
@@ -16,6 +16,8 @@ use notify::{recommended_watcher, Config, RecursiveMode::Recursive, Watcher};
 use shrimple_localhost::{print_request_result, Server, ServerError};
 use std::{
     env::set_current_dir,
+    fs::create_dir,
+    io::ErrorKind,
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -50,7 +52,14 @@ static RECOMPILE: AtomicBool = AtomicBool::new(true);
 
 fn main() -> Result {
     let args = Args::parse();
-    let output = args.output.canonicalize().context("failed to locate the output root")?.leak();
+    let output = utils::PathBufExt::leak(match args.output.canonicalize() {
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            create_dir(&args.output).context("failed to create the output directory")?;
+            args.output.canonicalize()?
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context("failed to locate the output root")),
+        Ok(x) => x,
+    });
     let abs_file = args.file.canonicalize().context("failed to locate the source file")?;
     let root = abs_file.parent().context("invalid source file")?;
     set_current_dir(root)?;

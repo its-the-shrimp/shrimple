@@ -1,10 +1,10 @@
 use crate::parser::Expected;
-use anyhow::Error;
 use shrimple_parser::{
     utils::{locate_in_multiple, FullLocation, WithSourceLine},
     FullParsingError,
 };
 use std::{
+    backtrace::BacktraceStatus,
     fmt::{Debug, Display, Formatter, Write},
     path::Path,
     sync::Arc,
@@ -34,13 +34,10 @@ impl Display for Expansions {
 
 impl std::error::Error for Expansions {}
 
-pub fn collect_template_expansion_info<Files, Filepath, Src>(error: Error, files: Files) -> Error
-where
-    Files: IntoIterator,
-    Files::IntoIter: Iterator<Item = (Filepath, Src)> + Clone,
-    Filepath: AsRef<Path>,
-    Src: AsRef<str>,
-{
+pub fn collect_template_expansion_info(
+    error: &anyhow::Error,
+    files: impl IntoIterator<Item = (impl AsRef<Path>, impl AsRef<str>), IntoIter: Clone>,
+) -> anyhow::Error {
     let root = error.root_cause();
     let loc = error.downcast_ref::<ExtraCtx<FullLocation<'static>>>().map(|x| x.0);
     let expansions = error.downcast_ref::<Expansions>().map(|x| &x.0);
@@ -56,23 +53,22 @@ where
     };
 
     if let Some(loc) = loc {
-        if write!(&mut msg, "\n--> {}", WithSourceLine(loc)).is_err() {
-            return error;
-        }
+        _ = write!(&mut msg, "\n--> {}", WithSourceLine(loc));
     }
 
     let files = files.into_iter();
     for &name in expansions.iter().flat_map(|x| x.iter().rev()) {
-        if write!(&mut msg, "\n\n...while expanding template `<${name}>`").is_err() {
-            return error;
-        }
+        _ = write!(&mut msg, "\n\n...while expanding template `<${name}>`"); 
         if let Some((path, loc)) = locate_in_multiple(name.as_ptr(), files.clone()) {
             let loc = FullLocation { loc, path: path.as_ref() };
-            if write!(&mut msg, "\n--> {}", WithSourceLine(loc)).is_err() {
-                return error;
-            }
+            _ = write!(&mut msg, "\n--> {}", WithSourceLine(loc));
         }
     }
 
-    Error::msg(msg)
+    let backtrace = error.backtrace();
+    if backtrace.status() == BacktraceStatus::Captured {
+        _ = write!(&mut msg, "\nOriginal backtrace:\n{backtrace}");
+    }
+
+    anyhow::Error::msg(msg)
 }

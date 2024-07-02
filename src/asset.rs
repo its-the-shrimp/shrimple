@@ -1,6 +1,6 @@
 use crate::utils::{OptionExt, ShortStr};
 use anyhow::{Context, Result};
-use std::{ffi::OsStr, fs::read_to_string, path::Path};
+use std::{ffi::OsStr, fs::read_to_string, path::{absolute, Path}};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // the string stored in the state is the source code
@@ -44,7 +44,7 @@ impl Asset {
         let path = path.as_ref();
         Ok(Self {
             path: Box::leak(
-                path.canonicalize()
+                absolute(path)
                     .with_context(|| format!("failed to locate {path:?}"))?
                     .into_boxed_path(),
             ),

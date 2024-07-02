@@ -11,7 +11,6 @@ use std::mem::take;
 use std::path::Path;
 use std::ptr::null;
 use ureq::Agent;
-use DoubleEndedIterator as Reversible;
 
 use crate::asset::{wrap_error, Asset, AssetState};
 use crate::error::{collect_template_expansion_info, Expansions, ExtraCtx};
@@ -93,11 +92,9 @@ impl EvalCtx {
 
     /// returns `src` not copied if it doesn't have anything that needs processing, otherwise
     /// returns a String built up by `f`
-    fn format_str(
-        &mut self,
-        src: &'static str,
-        f: impl FnOnce(&mut Self, &mut String) -> Result,
-    ) -> Result<Cow<'static, str>> {
+    fn format_str(&self, src: &'static str, f: impl FnOnce(&mut Self, &mut String) -> Result)
+        -> Result<Cow<'static, str>>
+    {
         Self::process(src, *self.file(), |ctx| {
             match ctx.parser.next() {
                 None => return Ok(src.into()),
@@ -112,7 +109,7 @@ impl EvalCtx {
     /// Guarantees to not change `self.iterators` or `self.expansions`
     fn enqueue(
         &mut self,
-        tokens: impl IntoIterator<IntoIter = impl Reversible<Item = XmlFragment>>,
+        tokens: impl IntoIterator<Item = XmlFragment, IntoIter: DoubleEndedIterator>,
     ) {
         self.queue.extend(tokens.into_iter().rev());
     }
@@ -222,7 +219,7 @@ impl Evaluator {
     fn eval_attr_value(
         &mut self,
         value: &AttrValue<'static>,
-        ctx: &mut EvalCtx,
+        ctx: &EvalCtx,
     ) -> Result<Option<Cow<'static, str>>> {
         Ok(Some(match *value {
             AttrValue::None => return Ok(None),
@@ -389,7 +386,7 @@ impl Evaluator {
         Ok(())
     }
 
-    fn handle_lua_template(&mut self, ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
+    fn handle_lua_template(&self, ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
         match ctx.next() {
             Some(XmlFragment::OpeningTagEnd(t)) if !t.is_self_closing() => (),
             Some(XmlFragment::Attr(_)) => bail!("`$lua` doesn't accept any attributes"),
@@ -455,7 +452,7 @@ impl Evaluator {
 
     /// paste children passed to the invocation of the currently expanded template
     #[allow(clippy::unused_self, /* reason="consistency with other template handlers" */)]
-    fn handle_children_template(&mut self, ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
+    fn handle_children_template(&self, ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
         let raw = match ctx.next() {
             Some(XmlFragment::OpeningTagEnd(t)) if t.is_self_closing() => false,
             Some(XmlFragment::OpeningTagEnd(_)) => bail!("`$children` doesn't accept children"),
@@ -547,7 +544,7 @@ impl Evaluator {
         Ok(())
     }
 
-    fn advance_iter(&mut self, ctx: &mut EvalCtx) -> Result {
+    fn advance_iter(&self, ctx: &mut EvalCtx) -> Result {
         let iter = ctx
             .iterators
             .last_mut()
@@ -572,7 +569,7 @@ impl Evaluator {
     }
 
     #[allow(clippy::unused_self, /* reason="consistency with other template handlers" */)]
-    fn handle_raw_template(&mut self, mut ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
+    fn handle_raw_template(&self, mut ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
         let element_name = match ctx.next() {
             Some(XmlFragment::Attr(attr)) if !attr.has_value() => {
                 let name = attr.name();
@@ -849,6 +846,7 @@ impl Evaluator {
                     "source"   |
                     "track"    |
                     "wbr"      => self.handle_void_element(name, ctx, dst, &[])?,
+                    "" => bail!("element name cannot be empty"),
                     _ if name.starts_with('$') => self.handle_template(&name[1..], ctx)?,
                     _ => self.handle_element(name, ctx, dst, &[], &mut tag_stack)?,
                 },
@@ -889,10 +887,21 @@ impl Evaluator {
     }
 
     fn eval_file(&mut self, ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
-        if ctx.file().path.extension() == Some(os_str("html")) {
-            dst.write_str("<!DOCTYPE html>\n")?;
+        let is_html = ctx.file().path.extension() == Some(os_str("html"));
+        if is_html {
+            dst.write_str("\
+                <!DOCTYPE html>\n\
+                <html>\n\
+                \t<head>\n\
+                \t\t<meta charset=\"UTF-8\">\n\
+                \t</head>\n\
+                ")?;
         }
-        self.eval(ctx, dst)
+        self.eval(ctx, dst)?;
+        if is_html {
+            dst.write_str("\n</html>\n")?;
+        }
+        Ok(())
     }
 
     pub fn eval_all(
@@ -963,7 +972,7 @@ pub fn eval(src: impl AsRef<Path>, root: impl AsRef<Path>, dst: impl AsRef<Path>
     let mut evaluator = Evaluator::default();
     evaluator.eval_all(src, root, dst).map_err(|e| {
         collect_template_expansion_info(
-            e,
+            &e,
             evaluator.assets.iter().map(|a| (a.path, a.src().unwrap_or(""))),
         )
     })

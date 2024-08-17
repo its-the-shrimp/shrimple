@@ -158,7 +158,7 @@ impl Default for Evaluator {
             http_client: Agent::new(),
             templates: default(),
             lua_ctx: default(),
-            processed_exts: vec![os_str("html"), os_str("css")],
+            processed_exts: vec![os_str("html"), os_str("css"), os_str("svg")],
             assets: vec![],
         }
     }
@@ -356,7 +356,7 @@ impl Evaluator {
                     "cached" => remote_cached = true,
                     "raw" => needs_processing = Some(false),
                     "processed" => needs_processing = Some(true),
-                    _ if attr.is_none() => {
+                    _ if attr.is_some() => {
                         bail!("can't define more than 1 reference in a single `$ref` element")
                     }
                     _ => attr = Some(new_attr),
@@ -677,7 +677,7 @@ impl Evaluator {
         Ok(())
     }
 
-    /// `EMPTY` is defined per the HTML spec
+    /// `IS_VOID` is defined per the HTML spec
     fn _handle_element<const IS_VOID: bool>(
         &mut self,
         name: &'static str,
@@ -744,13 +744,11 @@ impl Evaluator {
 
                         (true, false) => {
                             // ref attr, not cached
-                            let value = value.trim_start_matches('/');
-                            if !value.is_empty() && url_scheme(value).is_none() {
-                                self.add_asset(Asset::new(value, None, &self.processed_exts)?);
-                                write!(dst, "=\"/{value}\"")?;
-                            } else {
-                                write!(dst, "=\"{value}\"")?;
+                            let trimmed = value.trim_start_matches('/');
+                            if !trimmed.is_empty() && url_scheme(trimmed).is_none() {
+                                self.add_asset(Asset::new(trimmed, None, &self.processed_exts)?);
                             }
+                            write!(dst, "=\"{value}\"")?;
                         }
 
                         (false, true) => {
@@ -832,8 +830,12 @@ impl Evaluator {
                     "image" => self.handle_element(name, ctx, dst, &["href"], &mut tag_stack)?,
                     "link" => self.handle_void_element(name, ctx, dst, &["href"])?,
                     "img" => self.handle_void_element(name, ctx, dst, &["src"])?,
-                    "!DOCTYPE" => bail!("<!DOCTYPE> is inserted automatically & \
-                                         need not be specified explicitly"),
+                    "script" => self.handle_element(name, ctx, dst, &["src"], &mut tag_stack)?,
+                    "!DOCTYPE" |
+                    "html" => ensure!(
+                        ctx.file().path.extension() != Some(os_str("html")),
+                        "<{name}> is inserted automatically & need not be specified explicitly"
+                    ),
                     "area"     |
                     "base"     |
                     "br"       |

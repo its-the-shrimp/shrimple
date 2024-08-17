@@ -229,7 +229,7 @@ type ParsingResult<'input, T = (), E = Expected> = shrimple_parser::ParsingResul
 
 #[allow(clippy::trivially_copy_pass_by_ref, /* reason="easier to pass through parsers" */)]
 fn is_ident_char(ch: &char) -> bool {
-    ch.is_alphanumeric() || "_-$".contains(*ch)
+    ch.is_alphanumeric() || ":_-$".contains(*ch)
 }
 
 fn parse_word(input: &str) -> ParsingResult<&str> {
@@ -266,7 +266,7 @@ fn parse_attr_value(input: &str) -> ParsingResult<AttrValue> {
 fn parse_attr(input: &str) -> ParsingResult<Attr> {
     parse_whitespace
         .map(str::len)
-        .skip(parse_while(is_ident_char))
+        .skip(parse_while(is_ident_char).filter(|s| !s.is_empty()))
         .expect(Expected::AttrName)
         .get_span()
         .add(parse_char('=').then(parse_attr_value).or_value(AttrValue::None))

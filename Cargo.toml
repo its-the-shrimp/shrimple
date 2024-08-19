@@ -15,7 +15,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.9", features = ["lua54"] }
 ureq = "2.9.6"
-shrimple-localhost = "4"
+shrimple-localhost = "5"
 notify = "6.1.1"
 
 [lints.clippy]

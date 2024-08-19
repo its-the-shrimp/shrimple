@@ -13,7 +13,7 @@ use crate::{
 use anyhow::Context;
 use clap::Parser;
 use notify::{recommended_watcher, Config, RecursiveMode::Recursive, Watcher};
-use shrimple_localhost::{print_request_result, Server, ServerError};
+use shrimple_localhost::{print_request_result, Response, Server};
 use std::{
     env::set_current_dir,
     fs::create_dir,
@@ -63,8 +63,9 @@ fn main() -> Result {
     let abs_file = args.file.canonicalize().context("failed to locate the source file")?;
     let root = abs_file.parent().context("invalid source file")?;
     set_current_dir(root)?;
+    eval(&abs_file, root, output)?;
     if !args.watch {
-        return eval(&abs_file, root, output);
+        return Ok(());
     }
 
     let port = args.port.unwrap_or(Server::DEFAULT_PORT);
@@ -88,22 +89,43 @@ fn main() -> Result {
     watcher.watch(root, Recursive).context("failed to start the filesystem watcher")?;
 
     println!("Local server with hot-reloading set up at http://127.0.0.1:{port}");
-    loop {
-        let err = server
-            .try_serve_with_callback(
-                |_, _| {
-                    if !RECOMPILE.swap(false, Ordering::Relaxed) {
-                        return Ok(());
+    let mut err_text = None;
+
+    server
+        .serve_with_callback(
+            |_, path| {
+                if !RECOMPILE.swap(false, Ordering::Relaxed) {
+                    return err_text.clone().map_or_else(|| path.into(), Response::Data)
+                }
+                println!("Change detected, rebuilding website...");
+                match eval(&abs_file, root, output) {
+                    Ok(_) => {
+                        err_text = None;
+                        path.into()
+                    },
+                    Err(e) => {
+                        let mut text = e.to_string()
+                            .replace('&', "&amp;")
+                            .replace('<', "&lt;")
+                            .replace('>', "&gt;")
+                            .replace('"', "&quot;")
+                            .replace('\'', "&apos;");
+                        text.insert_str(0, "\
+                            <!DOCTYPE html>\
+                            <html>\
+                                <head>\
+                                    <meta charset=\"UTF-8\" />\
+                                </head>\
+                                <body style=\"background-color: black; color: #CC2222\">\
+                                    <code><pre>shrimple: compilation failed\n");
+                        text.push_str("</pre></code></body></html>");
+                        err_text = Some(text.clone().into_bytes());
+                        Response::Data(text.into_bytes())
                     }
-                    println!("Change detected, rebuilding website...");
-                    eval(&abs_file, root, output)
-                },
-                |addr, res| Ok(print_request_result(addr, res)),
-            )
-            .unwrap_err();
-        match err {
-            ServerError::Io(err) => println!("IO error: {err}"),
-            ServerError::Callback(err) => println!("{err:?}"),
-        }
-    }
+                }
+            },
+            print_request_result,
+        )?;
+
+    Ok(())
 }

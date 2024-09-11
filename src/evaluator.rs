@@ -451,7 +451,7 @@ impl Evaluator {
     }
 
     /// paste children passed to the invocation of the currently expanded template
-    #[allow(clippy::unused_self, /* reason="consistency with other template handlers" */)]
+    #[expect(clippy::unused_self, reason="consistency with other template handlers")]
     fn handle_children_template(&self, ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
         let raw = match ctx.next() {
             Some(XmlFragment::OpeningTagEnd(t)) if t.is_self_closing() => false,
@@ -568,7 +568,7 @@ impl Evaluator {
         Ok(())
     }
 
-    #[allow(clippy::unused_self, /* reason="consistency with other template handlers" */)]
+    #[expect(clippy::unused_self, reason="consistency with other template handlers")]
     fn handle_raw_template(&self, mut ctx: &mut EvalCtx, dst: &mut impl Write) -> Result {
         let element_name = match ctx.next() {
             Some(XmlFragment::Attr(attr)) if !attr.has_value() => {
@@ -826,16 +826,20 @@ impl Evaluator {
                     "$foreach" => self.handle_foreach_template(ctx)?,
                     "$registerProcessedExt" => self.handle_registerprocessedext_template(ctx)?,
                     "$raw" => self.handle_raw_template(ctx, dst)?,
+
                     "a"     |
-                    "image" => self.handle_element(name, ctx, dst, &["href"], &mut tag_stack)?,
+                    "image" |
+                    "use" => self.handle_element(name, ctx, dst, &["href"], &mut tag_stack)?,
                     "link" => self.handle_void_element(name, ctx, dst, &["href"])?,
                     "img" => self.handle_void_element(name, ctx, dst, &["src"])?,
                     "script" => self.handle_element(name, ctx, dst, &["src"], &mut tag_stack)?,
+
                     "!DOCTYPE" |
                     "html" => ensure!(
                         ctx.file().path.extension() != Some(os_str("html")),
                         "<{name}> is inserted automatically & need not be specified explicitly"
                     ),
+
                     "area"     |
                     "base"     |
                     "br"       |
@@ -848,8 +852,11 @@ impl Evaluator {
                     "source"   |
                     "track"    |
                     "wbr"      => self.handle_void_element(name, ctx, dst, &[])?,
+
                     "" => bail!("element name cannot be empty"),
+
                     _ if name.starts_with('$') => self.handle_template(&name[1..], ctx)?,
+
                     _ => self.handle_element(name, ctx, dst, &[], &mut tag_stack)?,
                 },
 

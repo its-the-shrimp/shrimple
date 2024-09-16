@@ -10,7 +10,7 @@ keywords = ["template-engine"]
 categories = ["template-engine", "compilers", "command-line-interface", "web-programming"]
 
 [dependencies]
-shrimple-parser = "0.0.2"
+shrimple-parser = { git = "https://github.com/its-the-shrimp/shrimple-parser" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.9", features = ["lua54"] }
@@ -24,6 +24,7 @@ undocumented_unsafe_blocks = "warn"
 deref_by_slicing = "warn"
 
 pedantic = { level = "warn", priority = -1 }
+explicit_deref_methods = "allow"
 must_use_candidate = "allow"
 cast_lossless = "allow"
 module_name_repetitions = "allow"

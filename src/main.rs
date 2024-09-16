@@ -5,6 +5,7 @@ mod evaluator;
 mod mime;
 mod parser;
 mod utils;
+mod view;
 
 use crate::{
     evaluator::eval,
@@ -18,8 +19,8 @@ use std::{
     env::set_current_dir,
     fs::create_dir,
     io::ErrorKind,
-    path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
+    path::{Path, PathBuf},
+    sync::{atomic::{AtomicBool, Ordering}, Arc},
 };
 
 #[derive(Parser)]
@@ -52,33 +53,36 @@ static RECOMPILE: AtomicBool = AtomicBool::new(true);
 
 fn main() -> Result {
     let args = Args::parse();
-    let output = utils::PathBufExt::leak(match args.output.canonicalize() {
+    let output: Arc<Path> = match args.output.canonicalize() {
         Err(e) if e.kind() == ErrorKind::NotFound => {
             create_dir(&args.output).context("failed to create the output directory")?;
             args.output.canonicalize()?
         }
         Err(e) => return Err(anyhow::Error::new(e).context("failed to locate the output root")),
         Ok(x) => x,
-    });
+    }.into();
     let abs_file = args.file.canonicalize().context("failed to locate the source file")?;
     let root = abs_file.parent().context("invalid source file")?;
     set_current_dir(root)?;
-    eval(&abs_file, root, output)?;
+    eval(&abs_file, root, &output)?;
     if !args.watch {
         return Ok(());
     }
 
     let port = args.port.unwrap_or(Server::DEFAULT_PORT);
-    let mut server = Server::new_at(output, port).context("failed to set up the local server")?;
+    let mut server = Server::new_at(&output, port).context("failed to set up the local server")?;
 
     let mut watcher =
-        recommended_watcher(move |event: notify::Result<notify::Event>| match event {
-            Ok(event) => {
-                if event.paths.iter().any(|p| !p.starts_with(output)) {
-                    RECOMPILE.store(true, Ordering::Relaxed);
+        recommended_watcher({
+            let output = output.clone();
+            move |event: notify::Result<notify::Event>| match event {
+                Ok(event) => {
+                    if event.paths.iter().any(|p| !p.starts_with(&output)) {
+                        RECOMPILE.store(true, Ordering::Relaxed);
+                    }
                 }
+                Err(err) => eprintln!("Error in the filesystem watcher:\n{err}"),
             }
-            Err(err) => eprintln!("Error in the filesystem watcher:\n{err}"),
         })
         .context("failed to configure the filesystem watcher")?;
     if args.poll {
@@ -98,7 +102,7 @@ fn main() -> Result {
                     return err_text.clone().map_or_else(|| path.into(), Response::Data)
                 }
                 println!("Change detected, rebuilding website...");
-                match eval(&abs_file, root, output) {
+                match eval(&abs_file, root, &output) {
                     Ok(_) => {
                         err_text = None;
                         path.into()

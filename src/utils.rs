@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::fmt::{self, Debug, Display, Formatter, Write};
 use std::mem::transmute;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr::copy_nonoverlapping;
 use std::str::from_utf8_unchecked;
 
@@ -54,16 +54,6 @@ pub trait OptionExt<T> {
 impl<T> OptionExt<T> for Option<T> {
     fn try_map<U, E>(self, f: impl FnOnce(T) -> Result<U, E>) -> Result<Option<U>, E> {
         self.map(f).transpose()
-    }
-}
-
-pub trait PathBufExt {
-    fn leak(self) -> &'static Path;
-}
-
-impl PathBufExt for PathBuf {
-    fn leak(self) -> &'static Path {
-        Box::leak(self.into_boxed_path())
     }
 }
 

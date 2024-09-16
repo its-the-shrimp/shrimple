@@ -1,37 +1,37 @@
 use shrimple_parser::{
-    from_tuple, parse_char, parse_exact, parse_group, parse_until, parse_until_ex,
-    parse_until_exact, parse_while,
-    tuple::{first, second},
-    utils::{eq, ne},
-    FullParsingError, Parser,
+    any,
+    from_tuple,
+    pattern::{parse, parse_group, parse_until, parse_until_ex, parse_while},
+    tuple::first,
+    FullParsingError,
+    Input,
+    Parser,
 };
 
 use crate::{
     asset::Asset,
     escape_html::EscapeHtml,
     utils::{is_in, Result},
+    view::StrView,
 };
 use std::{
-    convert::Infallible,
-    error::Error,
-    fmt::{self, Debug, Display, Formatter},
-    ptr::null,
+    convert::Infallible, error::Error, fmt::{self, Debug, Display, Formatter}, mem::take, ptr::null
 };
 
-#[derive(Debug, PartialEq, Eq, Default, Clone, Copy)]
-pub enum AttrValue<'src> {
+#[derive(Debug, PartialEq, Eq, Default, Clone)]
+pub enum AttrValue {
     /// No value
     #[default]
     None,
     /// Without the `$`
-    Var(&'src str),
+    Var(StrView),
     /// Without the `$()`
-    Expr(&'src str),
+    Expr(StrView),
     /// String literal or a word terminated by whitespace, `/`, `>`
-    Text(&'src str),
+    Text(StrView),
 }
 
-impl Display for AttrValue<'_> {
+impl Display for AttrValue {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         if f.alternate() {
             match self {
@@ -51,59 +51,69 @@ impl Display for AttrValue<'_> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub struct Attr<'src> {
-    prefix_and_name: &'src str,
-    /// Safety: `self.name_start < self.prefix_and_name.len()`
-    name_start: usize,
-    pub value: AttrValue<'src>,
+impl AttrValue {
+    pub const fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
 }
 
-impl Display for Attr<'_> {
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct Attr {
+    prefix_and_name: StrView,
+    /// Safety: `self.name_start < self.prefix_and_name.len()`
+    name_start: usize,
+    pub value: AttrValue,
+}
+
+impl Display for Attr {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         if f.alternate() {
             if self.has_value() {
-                write!(f, "{}={:#}", EscapeHtml(self.prefix_and_name), self.value)
+                write!(f, "{}={:#}", EscapeHtml(&self.prefix_and_name), self.value)
             } else {
-                Display::fmt(&EscapeHtml(self.prefix_and_name), f)
+                Display::fmt(&EscapeHtml(&self.prefix_and_name), f)
             }
         } else if self.has_value() {
             write!(f, "{}={}", self.prefix_and_name, self.value)
         } else {
-            Display::fmt(self.prefix_and_name, f)
+            Display::fmt(&self.prefix_and_name, f)
         }
     }
 }
 
-impl<'src> Attr<'src> {
+impl Attr {
     pub const fn has_value(&self) -> bool {
         !matches!(self.value, AttrValue::None)
     }
 
-    pub const fn as_src_ptr(&self) -> *const u8 {
+    pub fn as_src_ptr(&self) -> *const u8 {
         self.prefix_and_name.as_ptr()
     }
 
-    pub fn name(&self) -> &'src str {
+    pub fn name(&self) -> &str {
         &self.prefix_and_name[self.name_start..]
+    }
+
+    pub fn into_parts(self) -> (StrView, AttrValue) {
+        (self.prefix_and_name.after(self.name_start), self.value)
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 // Safety invariant: `!self.0.is_empty()`
-pub struct OpeningTagEnd<'src>(&'src str);
+pub struct OpeningTagEnd(StrView);
 
-impl Display for OpeningTagEnd<'_> {
+impl Display for OpeningTagEnd {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         if f.alternate() {
-            Display::fmt(&EscapeHtml(self.0), f)
+            Display::fmt(&EscapeHtml(&self.0), f)
         } else {
-            Display::fmt(self.0, f)
+            Display::fmt(&self.0, f)
         }
     }
 }
 
-impl OpeningTagEnd<'_> {
+impl OpeningTagEnd {
     pub fn as_src_ptr(&self) -> *const u8 {
         self.0.as_ptr().wrapping_add(self.0.len() - 1 - self.0.starts_with("/>") as usize)
     }
@@ -128,27 +138,27 @@ impl Display for EvalCmd {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum XmlFragment<'src> {
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum XmlFragment {
     /// <tagname
-    OpeningTagStart(&'src str),
+    OpeningTagStart(StrView),
     /// `key=value` or key
-    Attr(Attr<'src>),
+    Attr(Attr),
     /// `/>` or `>`
-    OpeningTagEnd(OpeningTagEnd<'src>),
+    OpeningTagEnd(OpeningTagEnd),
     /// </tagname>
-    ClosingTag(&'src str),
+    ClosingTag(StrView),
     /// $VARNAME
-    Var(&'src str),
+    Var(StrView),
     /// $(LUA CODE)
-    Expr(&'src str),
+    Expr(StrView),
     /// any other text
-    Text(&'src str),
+    Text(StrView),
     /// used by the evaluator
     Internal(EvalCmd),
 }
 
-impl Display for XmlFragment<'_> {
+impl Display for XmlFragment {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         if f.alternate() {
             match self {
@@ -176,7 +186,7 @@ impl Display for XmlFragment<'_> {
     }
 }
 
-impl XmlFragment<'_> {
+impl XmlFragment {
     /// For error reporting
     pub fn as_src_ptr(&self) -> *const u8 {
         match self {
@@ -225,119 +235,145 @@ impl From<Infallible> for Expected {
     }
 }
 
-type ParsingResult<'input, T = (), E = Expected> = shrimple_parser::ParsingResult<'input, T, E>;
+type ParsingResult<T = (), E = Expected> = shrimple_parser::ParsingResult<StrView, T, E>;
 
-#[allow(clippy::trivially_copy_pass_by_ref, /* reason="easier to pass through parsers" */)]
+#[expect(clippy::trivially_copy_pass_by_ref, reason="easier to pass through parsers")]
 fn is_ident_char(ch: &char) -> bool {
     ch.is_alphanumeric() || ":_-$".contains(*ch)
 }
 
-fn parse_word(input: &str) -> ParsingResult<&str> {
+fn parse_word(input: StrView) -> ParsingResult<StrView> {
     parse_until(is_in([' ', '\n', '\t', '/', '>'])).expect(Expected::Word)(input)
 }
 
-fn parse_whitespace(input: &str) -> ParsingResult<&str, Infallible> {
+fn parse_whitespace(input: StrView) -> ParsingResult<StrView, Infallible> {
     parse_while(char::is_ascii_whitespace)(input)
 }
 
 /// Recoverable if no initial double quote found
-fn parse_string_literal(input: &str) -> ParsingResult<&str> {
-    parse_char('"').then(parse_until_ex(eq('"')).expect(Expected::StrLiteral))(input)
+fn parse_string_literal(input: StrView) -> ParsingResult<StrView> {
+    parse('"')
+        .map_reason(|x| match x {})
+        .then(parse_until_ex('"').expect(Expected::StrLiteral))
+        .parse(input)
 }
 
 /// Recoverable if no initial "$(" found
-fn parse_template_expr(input: &str) -> ParsingResult<&str> {
-    parse_char('$').then(parse_group('(', ')').narrow_reason(Expected::TemplateExpr))(input)
+fn parse_template_expr(input: StrView) -> ParsingResult<StrView> {
+    parse('$')
+        .map_reason(|x| match x {})
+        .then(parse_group('(', ')').map_reason(|_| Expected::TemplateExpr))
+        .parse(input)
 }
 
-fn parse_template_var(input: &str) -> ParsingResult<&str> {
-    parse_char('$')
-        .then(parse_while(is_ident_char).filter(ne("")).expect(Expected::TemplateVarName))(input)
+fn parse_template_var(input: StrView) -> ParsingResult<StrView> {
+    parse('$')
+        .map_reason(|x| match x {})
+        .then(parse_while(is_ident_char) 
+            .filter(|s: &StrView| !s.is_empty())
+            .expect(Expected::TemplateVarName))
+        .parse(input) 
 }
 
-fn parse_attr_value(input: &str) -> ParsingResult<AttrValue> {
-    parse_template_expr
-        .map(AttrValue::Expr)
-        .or(parse_template_var.map(AttrValue::Var))
-        .or(parse_string_literal.map(AttrValue::Text))
-        .or(parse_word.map(AttrValue::Text))(input)
+fn parse_attr_value(input: StrView) -> ParsingResult<AttrValue> {
+    any! {
+        parse_template_expr.map(AttrValue::Expr),
+        parse_template_var.map(AttrValue::Var),
+        parse_string_literal.map(AttrValue::Text),
+        parse_word.map(AttrValue::Text),
+    }.parse(input)
 }
 
-fn parse_attr(input: &str) -> ParsingResult<Attr> {
+fn parse_attr(input: StrView) -> ParsingResult<Attr> {
     parse_whitespace
-        .map(str::len)
-        .skip(parse_while(is_ident_char).filter(|s| !s.is_empty()))
+        .map(|s| s.len())
+        .skip(parse_while(is_ident_char).filter(|s: &StrView| !s.is_empty()))
         .expect(Expected::AttrName)
         .get_span()
-        .add(parse_char('=').then(parse_attr_value).or_value(AttrValue::None))
-        .map(from_tuple!(Attr { name_start, prefix_and_name, value }))(input)
+        .add(parse('=')
+            .map_reason(|x| match x {})
+            .then(parse_attr_value)
+            .or_value(AttrValue::None))
+        .map(from_tuple!(Attr { name_start, prefix_and_name, value }))
+        .parse(input)
 }
 
 /// The output is the element name, without the `<`.
 /// Recoverable if no initial `<` is found.
-fn parse_opening_tag_start(input: &str) -> ParsingResult<&str> {
-    parse_char('<').then(parse_word)(input)
+fn parse_opening_tag_start(input: StrView) -> ParsingResult<StrView> {
+    parse('<').map_reason(|x| match x {}).then(parse_word)(input)
 }
 
 /// Any returned error is recoverable.
-fn parse_opening_tag_end(input: &str) -> ParsingResult<OpeningTagEnd, Infallible> {
+fn parse_opening_tag_end(input: StrView) -> ParsingResult<OpeningTagEnd, Infallible> {
     parse_whitespace
-        .maybe_skip(parse_char('/'))
-        .skip(parse_char('>'))
+        .skip(parse('/'))
+        .and(parse('>'))
         .get_span()
-        .map(second)
-        .map(OpeningTagEnd)(input)
+        .map(|(.., span)| OpeningTagEnd(span))
+        .parse(input)
 }
 
 /// Recoverable if no initial `<!--` is found.
-fn parse_comment(input: &str) -> ParsingResult<&str> {
-    parse_exact("<!--").then(parse_until_exact("-->").expect(Expected::Comment))(input)
+fn parse_comment(input: StrView) -> ParsingResult<StrView> {
+    parse("<!--")
+        .map_reason(|x| match x {})
+        .then(parse_until_ex("-->").expect(Expected::Comment))
+        .parse(input)
 }
 
-fn parse_closing_tag(input: &str) -> ParsingResult<&str> {
-    parse_exact("</")
+fn parse_closing_tag(input: StrView) -> ParsingResult<StrView> {
+    parse("</")
+        .map_reason(|x| match x {})
         .then(parse_word)
-        .maybe_skip(parse_whitespace)
-        .skip(parse_char('>').expect(Expected::ClosedTag))(input)
+        .skip(parse_whitespace.map_reason(|x| match x {}))
+        .skip(parse('>').expect(Expected::ClosedTag))
+        .parse(input)
 }
 
-fn parse_xml_fragment(input: &str) -> ParsingResult<XmlFragment> {
-    parse_comment.repeat().then(
-        parse_closing_tag
-            .map(XmlFragment::ClosingTag)
-            .or(parse_opening_tag_start.map(XmlFragment::OpeningTagStart))
-            .or(parse_template_expr.map(XmlFragment::Expr))
-            .or(parse_template_var.map(XmlFragment::Var))
-            .or(parse_until(is_in(['$', '<'])).map(XmlFragment::Text).narrow_reason(Expected::Word))
-            .or_map_rest(XmlFragment::Text),
-    )(input)
+fn parse_xml_fragment(input: StrView) -> ParsingResult<XmlFragment> {
+    parse_comment
+        .repeat()
+        .then(any! {
+            parse_closing_tag.map(XmlFragment::ClosingTag),
+            parse_opening_tag_start.map(XmlFragment::OpeningTagStart),
+            parse_template_expr.map(XmlFragment::Expr),
+            parse_template_var.map(XmlFragment::Var),
+            parse_until(is_in(['$', '<'])).map(XmlFragment::Text).map_reason(|x| match x {}),
+            else: XmlFragment::Text
+        })
+        .parse(input)
 }
 
-fn parse_xml_fragment_in_opening_tag(input: &str) -> ParsingResult<XmlFragment> {
-    parse_opening_tag_end.map(XmlFragment::OpeningTagEnd).or(parse_attr.map(XmlFragment::Attr))(
-        input,
-    )
+fn parse_xml_fragment_in_opening_tag(input: StrView) -> ParsingResult<XmlFragment> {
+    parse_opening_tag_end
+        .map_reason(|x| match x {})
+        .map(XmlFragment::OpeningTagEnd)
+        .or(parse_attr.map(XmlFragment::Attr))
+        .parse(input)
 }
 
+#[derive(Clone)]
 pub struct ShrimpleParser {
     file: Asset,
-    input: &'static str,
+    input: StrView,
     parsing_attrs: bool,
     error: Result<(), FullParsingError<'static, Expected>>,
 }
 
 impl Iterator for ShrimpleParser {
-    type Item = XmlFragment<'static>;
+    type Item = XmlFragment;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.error.is_err() || self.input.is_empty() {
             return None;
         }
 
+        let input = take(&mut self.input);
         let res = if self.parsing_attrs {
-            parse_xml_fragment_in_opening_tag(self.input)
+            parse_xml_fragment_in_opening_tag(input)
         } else {
-            parse_xml_fragment(self.input)
+            parse_xml_fragment(input)
         };
         match res {
             Ok((input, res)) => {
@@ -347,7 +383,10 @@ impl Iterator for ShrimpleParser {
                 Some(res)
             }
             Err(e) => {
-                self.error = Err(e.with_src_loc(self.file.path, self.file.src().unwrap_or("")));
+                self.error = Err(e.with_src_loc(
+                    self.file.path.to_path_buf(),
+                    &self.file.src().unwrap_or_default(),
+                ));
                 None
             }
         }
@@ -355,7 +394,7 @@ impl Iterator for ShrimpleParser {
 }
 
 impl ShrimpleParser {
-    pub const fn new(input: &'static str, file: Asset) -> Self {
+    pub const fn new(input: StrView, file: Asset) -> Self {
         Self { input, file, parsing_attrs: false, error: Ok(()) }
     }
 
@@ -364,7 +403,7 @@ impl ShrimpleParser {
     }
 
     /// returns
-    pub const fn finish(self) -> Result<(), FullParsingError<'static, Expected>> {
+    pub fn finish(self) -> Result<(), FullParsingError<'static, Expected>> {
         self.error
     }
 }

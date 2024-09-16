@@ -1,6 +1,6 @@
-use crate::parser::Expected;
+use crate::{parser::Expected, view::StrView};
 use shrimple_parser::{
-    utils::{locate_in_multiple, FullLocation, WithSourceLine},
+    utils::{locate_in_multiple, FullLocation, PathLike, WithSourceLine},
     FullParsingError,
 };
 use std::{
@@ -24,7 +24,7 @@ impl<T: Debug> std::error::Error for ExtraCtx<T> {}
 /// The contained strings are the templates' names in the source code at the location where it's
 /// used.
 #[derive(Debug, Clone)]
-pub struct Expansions(pub Arc<[&'static str]>);
+pub struct Expansions(pub Arc<[StrView]>);
 
 impl Display for Expansions {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -39,7 +39,7 @@ pub fn collect_template_expansion_info(
     files: impl IntoIterator<Item = (impl AsRef<Path>, impl AsRef<str>), IntoIter: Clone>,
 ) -> anyhow::Error {
     let root = error.root_cause();
-    let loc = error.downcast_ref::<ExtraCtx<FullLocation<'static>>>().map(|x| x.0);
+    let loc = error.downcast_ref::<ExtraCtx<FullLocation<'static>>>().map(|x| &x.0);
     let expansions = error.downcast_ref::<Expansions>().map(|x| &x.0);
 
     // the `\r` is prepended to discard the "Error: " that Rust prints before printing an error
@@ -47,7 +47,7 @@ pub fn collect_template_expansion_info(
     let (mut msg, loc) = match root.downcast_ref::<FullParsingError<'static, Expected>>() {
         Some(err) => (
             err.reason.map_or_else(|| "\rthis is a bug :3".to_owned(), |x| format!("\rerror: {x}")),
-            Some(err.loc),
+            Some(&err.loc),
         ),
         None => (format!("\rerror: {root}"), loc),
     };
@@ -57,11 +57,11 @@ pub fn collect_template_expansion_info(
     }
 
     let files = files.into_iter();
-    for &name in expansions.iter().flat_map(|x| x.iter().rev()) {
+    for name in expansions.iter().flat_map(|x| x.iter().rev()) {
         _ = write!(&mut msg, "\n\n...while expanding template `<${name}>`"); 
         if let Some((path, loc)) = locate_in_multiple(name.as_ptr(), files.clone()) {
-            let loc = FullLocation { loc, path: path.as_ref() };
-            _ = write!(&mut msg, "\n--> {}", WithSourceLine(loc));
+            let loc = FullLocation { loc, path: path.as_ref().into_path_bytes() };
+            _ = write!(&mut msg, "\n--> {}", WithSourceLine(&loc));
         }
     }
 

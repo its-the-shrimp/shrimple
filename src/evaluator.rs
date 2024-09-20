@@ -18,7 +18,7 @@ use crate::mime::remote_file_ext;
 use crate::parser::{url_scheme, Attr, AttrValue, EvalCmd, ShrimpleParser, XmlFragment};
 use crate::utils::{
     assume_static, assume_static_mut, default, os_str, soft_link, OptionExt, Prefixed, Result,
-    ShortStr,
+    ShortStr, StrExt,
 };
 use crate::view::{OsStrView, StrView, View};
 
@@ -720,7 +720,7 @@ impl Evaluator {
                         }
 
                         (true, false) => { // ref attr, not cached
-                            let trimmed = value.trim_start_matches('/');
+                            let trimmed = value.trim_start_matches('/').trim_fragment();
                             if !trimmed.is_empty() && url_scheme(trimmed).is_none() {
                                 self.add_asset(Asset::new(trimmed, None, &self.processed_exts)?);
                             }

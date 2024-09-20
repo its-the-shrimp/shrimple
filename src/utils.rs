@@ -194,3 +194,13 @@ pub fn soft_link(original: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io:
 pub fn soft_link(original: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io::Result<()> {
     std::os::unix::fs::symlink(original, link)
 }
+
+pub trait StrExt {
+    fn trim_fragment(&self) -> &Self;
+}
+
+impl StrExt for str {
+    fn trim_fragment(&self) -> &Self {
+        self.split_once('#').map_or(self, |(path, _frag)| path)
+    }
+}

@@ -807,6 +807,7 @@ impl Evaluator {
                     "link" => self.handle_void_element(name, ctx, dst, &["href"])?,
                     "img" => self.handle_void_element(name, ctx, dst, &["src"])?,
                     "script" => self.handle_element(name, ctx, dst, &["src"], &mut tag_stack)?,
+                    "form" => self.handle_element(name, ctx, dst, &["action"], &mut tag_stack)?,
 
                     "!DOCTYPE" |
                     "html" => ensure!(

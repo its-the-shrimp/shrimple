@@ -409,5 +409,5 @@ impl ShrimpleParser {
 }
 
 pub fn url_scheme(url: &str) -> Option<&str> {
-    url.split_once(':').map(first)
+    url.split_once("://").map(first)
 }

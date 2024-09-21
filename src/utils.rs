@@ -1,4 +1,5 @@
 use core::slice;
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::fmt::{self, Debug, Display, Formatter, Write};
@@ -195,12 +196,16 @@ pub fn soft_link(original: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io:
     std::os::unix::fs::symlink(original, link)
 }
 
-pub trait StrExt {
-    fn trim_fragment(&self) -> &Self;
-}
-
-impl StrExt for str {
-    fn trim_fragment(&self) -> &Self {
-        self.split_once('#').map_or(self, |(path, _frag)| path)
+pub fn rel_link_to_file_path(link: &str) -> Cow<'_, Path> {
+    let normalised: &Path = link
+        .split_once('#').map_or(link, |(path, _query)| path) // removing the fragment
+        .trim_start_matches('/') // ensuring the path is relative
+        .as_ref();
+    if normalised.as_os_str().is_empty() {
+        return Cow::Borrowed("index.html".as_ref());
+    }
+    match normalised.extension() {
+        Some(_) => Cow::Borrowed(normalised),
+        None => Cow::Owned(normalised.with_extension("html")),
     }
 }

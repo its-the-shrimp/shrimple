@@ -545,9 +545,9 @@ dependencies = [
 
 [[package]]
 name = "shrimple-localhost"
-version = "5.0.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7211fcd655ae05f9c5483b81cab6e011396802cac6cda8e9e952dd4bbbd16bb5"
+checksum = "4d746c05a454358a607af8b2a8f0322c99841c2fc4e7ac5f227abe6393c34e90"
 
 [[package]]
 name = "shrimple-parser"

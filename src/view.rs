@@ -152,7 +152,7 @@ impl<T: ?Sized + Display> Display for View<'_, T> {
     }
 }
 
-impl<'borrow, T: ?Sized> Clone for View<'borrow, T> {
+impl<T: ?Sized> Clone for View<'_, T> {
     fn clone(&self) -> Self {
         if self.off != usize::MAX {
             // Safety: if `off` isn't `usize::MAX`, it's the offset from the start of the memory

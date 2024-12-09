@@ -119,6 +119,7 @@ impl EvalCtx {
     }
 }
 
+#[derive(Clone)]
 struct TemplateAttr {
     name: StrView,
     default: Option<StrView>,
@@ -617,7 +618,7 @@ impl Evaluator {
             .find(|(_, t)| *t.name == *name)
             .with_context(|| format!("unknown template `${name}`"))?;
         let content = take(&mut template.children);
-        let mut attrs = take(&mut template.attrs);
+        let mut attrs = template.attrs.clone();
         let accepts_children = template.accepts_children;
 
         while let Some(frag) = ctx.next() {
@@ -679,12 +680,11 @@ impl Evaluator {
         ctx.enqueue(content.iter().cloned());
         let template = &mut self.templates[index];
         template.children = content;
-        template.attrs = attrs;
         Ok(())
     }
 
     /// `IS_VOID` is defined per the HTML spec
-    fn _handle_element<const IS_VOID: bool>(
+    fn handle_any_element<const IS_VOID: bool>(
         &mut self,
         name: StrView,
         ctx: &mut EvalCtx,
@@ -772,7 +772,7 @@ impl Evaluator {
         ref_attrs: &[&str],
         tag_stack: &mut Vec<StrView>,
     ) -> Result {
-        self._handle_element::<false>(name, ctx, dst, ref_attrs, tag_stack)
+        self.handle_any_element::<false>(name, ctx, dst, ref_attrs, tag_stack)
     }
 
     /// <https://developer.mozilla.org/en-US/docs/Glossary/Void_element>
@@ -784,7 +784,7 @@ impl Evaluator {
         // names of attributes that might contain a reference to a file
         ref_attrs: &[&str],
     ) -> Result {
-        self._handle_element::<true>(name, ctx, dst, ref_attrs, &mut vec![])
+        self.handle_any_element::<true>(name, ctx, dst, ref_attrs, &mut vec![])
     }
 
     #[rustfmt::skip]

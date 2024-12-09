@@ -10,7 +10,7 @@ keywords = ["template-engine"]
 categories = ["template-engine", "compilers", "command-line-interface", "web-programming"]
 
 [dependencies]
-shrimple-parser = { git = "https://github.com/its-the-shrimp/shrimple-parser" }
+shrimple-parser = "0.0.4"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.9", features = ["lua54"] }

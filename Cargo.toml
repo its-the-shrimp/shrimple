@@ -1,6 +1,6 @@
 [package]
 name = "shrimple"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Minimal CLI for static website generation, supercharged with Lua"
 authors = ["Tim Kurdov <tim.kurdov@gmail.com>"]
@@ -10,7 +10,7 @@ keywords = ["template-engine"]
 categories = ["template-engine", "compilers", "command-line-interface", "web-programming"]
 
 [dependencies]
-shrimple-parser = "0.0.4"
+shrimple-parser = "0.0.5"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 mlua = { version = "0.9", features = ["lua54"] }

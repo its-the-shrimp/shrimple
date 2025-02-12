@@ -55,7 +55,7 @@ impl Iterator for EvalCtx {
 }
 
 impl EvalCtx {
-    fn process<R>(
+    fn process<R: std::fmt::Debug>(
         src: StrView,
         asset: Asset,
         f: impl FnOnce(&mut Self) -> Result<R>,
@@ -904,9 +904,7 @@ impl Evaluator {
         self.add_asset(Asset::new_template(src)?);
         let mut dst = String::new();
 
-        while let Some((src, file)) =
-            self.assets.iter_mut().find_map(|x| x.src_for_processing().map(|s| (s, x.clone())))
-        {
+        while let Some((src, file)) = self.assets.iter_mut().find_map(Asset::src_for_processing) {
             dst.clear();
             let dst_path = dst_root.join(file.path.strip_prefix(src_root)?);
             EvalCtx::process(src, file, |ctx| self.eval_file(ctx, &mut dst))?;

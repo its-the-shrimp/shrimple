@@ -65,11 +65,11 @@ impl Asset {
         }
     }
 
-    /// if `self` is `Template`, switches it to `Processed` and returns the source code, otherwise
-    /// returns None
-    pub fn src_for_processing(&mut self) -> Option<StrView> {
+    /// if `self` is `Template`, switches it to `Processed` and returns the source code & the
+    /// original asset, otherwise returns None
+    pub fn src_for_processing(&mut self) -> Option<(StrView, Self)> {
         match replace(&mut self.state, AssetState::Processed) {
-            AssetState::Template(src) => Some(src),
+            AssetState::Template(src) => Some((src.clone(), Self { state: AssetState::Template(src), path: self.path.clone() })),
             prev => {
                 self.state = prev;
                 None

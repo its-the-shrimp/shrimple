@@ -673,7 +673,7 @@ impl Compiler {
         let doctype_element = existing_doctype_element.unwrap_or_else(|| {
             XmlNode::Element(XmlElement {
                 name: "!DOCTYPE".into(),
-                attrs: [Attr { name: "html".into(), value: default() }].into(),
+                attrs: [("html", None).into()].into(),
                 body: default(),
             })
         });
@@ -692,29 +692,48 @@ impl Compiler {
         let mut extra_children_in_html = Vec::with_capacity(html_element.body.len());
         let mut existing_body_element = None;
         let mut existing_head_element = None;
+        let mut existing_charset_element = None;
         for child in take(&mut html_element.body) {
-            match &child {
-                XmlNode::Element(x) if x.name == "head" => existing_head_element = Some(child),
-                XmlNode::Element(x) if x.name == "body" => existing_body_element = Some(child),
-                _ => extra_children_in_html.push(child),
+            match child {
+                XmlNode::Element(x) if x.name == "head" => existing_head_element = Some(x),
+                XmlNode::Element(x) if x.name == "body" => existing_body_element = Some(x),
+                XmlNode::Element(x) if x.name == "meta" && x.attr("charset").is_some() => {
+                    existing_charset_element = Some(x);
+                }
+                extra => extra_children_in_html.push(extra),
             }
         }
 
-        let head_element = match existing_head_element {
-            Some(XmlNode::Element(mut existing)) => {
-                existing.body = chain(take(&mut existing.body), extra_children_in_html).collect();
-                XmlNode::Element(existing)
-            }
-
-            _ => XmlNode::Element(XmlElement {
-                name: "head".into(),
-                attrs: default(),
-                body: extra_children_in_html.into(),
+        let charset_element = match existing_charset_element {
+            Some(existing) => Some(existing),
+            None if existing_head_element.as_ref().is_some_and(|head| {
+                head.subelements("meta").any(|x| x.attr("charset").is_some())
+            }) => None,
+            None => Some(XmlElement {
+                name: "meta".into(),
+                attrs: [("charset", Some("UTF-8")).into()].into(),
+                body: default(),
             }),
         };
+        let head_element = match existing_head_element {
+            Some(mut existing) => {
+                let mut existing_body = take(&mut existing.body).into_vec();
+                existing_body.extend(extra_children_in_html);
+                existing_body.extend(charset_element.map(XmlNode::Element));
+                existing.body = existing_body.into();
+                existing
+            }
+
+            None => XmlElement {
+                name: "head".into(),
+                attrs: default(),
+                body: chain(charset_element.map(XmlNode::Element), extra_children_in_html).collect(),
+            },
+        };
+
         let body_element = existing_body_element
-            .unwrap_or_else(|| XmlNode::Element(XmlElement { name: "body".into(), ..default() }));
-        html_element.body = [head_element, body_element].into();
+            .unwrap_or_else(|| XmlElement { name: "body".into(), ..default() });
+        html_element.body = [head_element, body_element].map(XmlNode::Element).into();
     }
 
     pub fn compile(&mut self) -> Result {

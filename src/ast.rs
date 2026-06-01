@@ -20,6 +20,12 @@ pub struct Attr {
     pub value: XmlText,
 }
 
+impl From<(&'static str, Option<&'static str>)> for Attr {
+    fn from((name, value): (&'static str, Option<&'static str>)) -> Self {
+        Self { name: name.into(), value: value.map_or_else(default, Into::into) }
+    }
+}
+
 impl Display for Attr {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(" ")?;
@@ -67,6 +73,18 @@ impl Display for XmlElement {
 }
 
 impl XmlElement {
+    pub fn attr(&self, name: &str) -> Option<&Attr> {
+        self.attrs.iter().find(|attr| attr.name == name)
+    }
+
+    pub fn subelements<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a Self> {
+        self.body.iter().filter_map(move |x| x.as_element(name))
+    }
+
+    pub fn subelements_mut<'a>(&'a mut self, name: &str) -> impl Iterator<Item = &'a mut Self> {
+        self.body.iter_mut().filter_map(move |x| x.as_element_mut(name))
+    }
+
     /// Must be at the state <elementName ...
     ///                                   ^
     fn parse(
@@ -137,6 +155,12 @@ pub struct XmlText {
     pub parts: Box<[XmlTextFragment]>,
 }
 
+impl From<&'static str> for XmlText {
+    fn from(value: &'static str) -> Self {
+        Self { parts: [XmlTextFragment::Text(value.into())].into() }
+    }
+}
+
 impl Display for XmlText {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         self.parts.iter().try_for_each(|part| part.fmt(f))
@@ -184,7 +208,14 @@ impl Display for XmlNode {
 }
 
 impl XmlNode {
-    pub fn as_element_mut(&mut self, name: &str) -> Option<&mut XmlElement> {
+    pub fn as_element<'a>(&'a self, name: &str) -> Option<&'a XmlElement> {
+        match self {
+            Self::Element(element) => (element.name == name).then_some(element),
+            Self::Text(_) => None,
+        }
+    }
+
+    pub fn as_element_mut<'a>(&'a mut self, name: &str) -> Option<&'a mut XmlElement> {
         match self {
             Self::Element(element) => (element.name == name).then_some(element),
             Self::Text(_) => None,

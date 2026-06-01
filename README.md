@@ -12,7 +12,7 @@ shrimple
 ```
 This will build the website with `index.html` as its root and paste the root and all the files it references into `dist`
 ### 2. Compute anything anywhere with Lua
-`shrimple` has Lua evaluation built-in and it can be utilised in any part of any file: in text nodes, in attributes, inside strings, you name it!
+`shrimple` has Lua evaluation built-in and it can be utilised in any part of any file: in text nodes, in attributes, inside strings, you name it! (TODO: eval in attr & element names)
 Use `$VAR` to access a Lua variable, and `$(code)` or `<$lua>code</$lua>` to evaluate arbitrary Lua code and paste its return value
 ```html
 <$lua>

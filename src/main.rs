@@ -1,26 +1,30 @@
 mod asset;
+mod ast;
+mod compiler;
 mod error;
 mod escape_html;
-mod evaluator;
 mod mime;
 mod parser;
 mod utils;
 mod view;
 
-use crate::{
-    evaluator::eval,
-    utils::Result,
-};
-use anyhow::Context;
-use clap::Parser;
-use notify::{recommended_watcher, Config, RecursiveMode::Recursive, Watcher};
-use shrimple_localhost::{print_request_result, Response, Server};
-use std::{
-    env::set_current_dir,
-    fs::create_dir,
-    io::ErrorKind,
-    path::{Path, PathBuf},
-    sync::{atomic::{AtomicBool, Ordering}, Arc},
+use {
+    crate::{compiler::compile, utils::Result},
+    anyhow::Context,
+    clap::Parser,
+    notify::{Config, RecursiveMode::Recursive, Watcher, recommended_watcher},
+    shrimple_localhost::{Response, Server, print_request_result},
+    std::{
+        env::set_current_dir,
+        fs::create_dir,
+        io::ErrorKind,
+        path::{Path, PathBuf},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    },
+    tokio::runtime::Builder,
 };
 
 #[derive(Parser)]
@@ -52,6 +56,9 @@ struct Args {
 static RECOMPILE: AtomicBool = AtomicBool::new(true);
 
 fn main() -> Result {
+    let async_runtime =
+        Builder::new_current_thread().build().context("failed to initialise the async runtime")?;
+
     let args = Args::parse();
     let output: Arc<Path> = match args.output.canonicalize() {
         Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -60,11 +67,20 @@ fn main() -> Result {
         }
         Err(e) => return Err(anyhow::Error::new(e).context("failed to locate the output root")),
         Ok(x) => x,
-    }.into();
+    }
+    .into();
     let abs_file = args.file.canonicalize().context("failed to locate the source file")?;
     let root = abs_file.parent().context("invalid source file")?;
     set_current_dir(root)?;
-    eval(&abs_file, root, &output)?;
+
+    let abs_file = abs_file
+        .file_name()
+        .with_context(|| format!("website root path is not a file path: {abs_file:?}"))?
+        .to_str()
+        .with_context(|| format!("website root path is not UTF-8: {abs_file:?}"))?;
+
+    async_runtime.block_on(compile(abs_file, &output))?;
+
     if !args.watch {
         return Ok(());
     }
@@ -72,19 +88,18 @@ fn main() -> Result {
     let port = args.port.unwrap_or(Server::DEFAULT_PORT);
     let mut server = Server::new_at(&output, port).context("failed to set up the local server")?;
 
-    let mut watcher =
-        recommended_watcher({
-            let output = output.clone();
-            move |event: notify::Result<notify::Event>| match event {
-                Ok(event) => {
-                    if event.paths.iter().any(|p| !p.starts_with(&output)) {
-                        RECOMPILE.store(true, Ordering::Relaxed);
-                    }
+    let mut watcher = recommended_watcher({
+        let output = output.clone();
+        move |event: notify::Result<notify::Event>| match event {
+            Ok(event) => {
+                if event.paths.iter().any(|p| !p.starts_with(&output)) {
+                    RECOMPILE.store(true, Ordering::Relaxed);
                 }
-                Err(err) => eprintln!("Error in the filesystem watcher:\n{err}"),
             }
-        })
-        .context("failed to configure the filesystem watcher")?;
+            Err(err) => eprintln!("Error in the filesystem watcher:\n{err}"),
+        }
+    })
+    .context("failed to configure the filesystem watcher")?;
     if args.poll {
         watcher
             .configure(Config::default().with_manual_polling())
@@ -95,41 +110,44 @@ fn main() -> Result {
     println!("Local server with hot-reloading set up at http://127.0.0.1:{port}");
     let mut err_text = None;
 
-    server
-        .serve_with_callback(
-            |_, path| {
-                if !RECOMPILE.swap(false, Ordering::Relaxed) {
-                    return err_text.clone().map_or_else(|| path.into(), Response::Data)
+    server.serve_with_callback(
+        |_, path| {
+            if !RECOMPILE.swap(false, Ordering::Relaxed) {
+                return err_text.clone().map_or_else(|| path.into(), Response::Data);
+            }
+            println!("Change detected, rebuilding website...");
+            match async_runtime.block_on(compile(abs_file, &output)) {
+                Ok(_) => {
+                    err_text = None;
+                    path.into()
                 }
-                println!("Change detected, rebuilding website...");
-                match eval(&abs_file, root, &output) {
-                    Ok(_) => {
-                        err_text = None;
-                        path.into()
-                    },
-                    Err(e) => {
-                        let mut text = e.to_string()
-                            .replace('&', "&amp;")
-                            .replace('<', "&lt;")
-                            .replace('>', "&gt;")
-                            .replace('"', "&quot;")
-                            .replace('\'', "&apos;");
-                        text.insert_str(0, "\
+                Err(e) => {
+                    let mut text = e
+                        .to_string()
+                        .replace('&', "&amp;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;")
+                        .replace('"', "&quot;")
+                        .replace('\'', "&apos;");
+                    text.insert_str(
+                        0,
+                        "\
                             <!DOCTYPE html>\
                             <html>\
                                 <head>\
                                     <meta charset=\"UTF-8\" />\
                                 </head>\
                                 <body style=\"background-color: black; color: #CC2222\">\
-                                    <code><pre>shrimple: compilation failed\n");
-                        text.push_str("</pre></code></body></html>");
-                        err_text = Some(text.clone().into_bytes());
-                        Response::Data(text.into_bytes())
-                    }
+                                    <code><pre>shrimple: compilation failed\n",
+                    );
+                    text.push_str("</pre></code></body></html>");
+                    err_text = Some(text.clone().into_bytes());
+                    Response::Data(text.into_bytes())
                 }
-            },
-            print_request_result,
-        )?;
+            }
+        },
+        print_request_result,
+    )?;
 
     Ok(())
 }

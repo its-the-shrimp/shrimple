@@ -1,8 +1,8 @@
 use {
-    shrimple_parser::{pattern::Pattern, tuple::first, Input},
+    shrimple_parser::{Input, pattern::Pattern, tuple::first},
     std::{
         cmp::Ordering,
-        ffi::OsStr,
+        ffi::{OsStr, OsString},
         fmt::{Debug, Display, Formatter},
         hash::{Hash, Hasher},
         iter::FusedIterator,
@@ -12,7 +12,7 @@ use {
         path::{Path, PathBuf},
         ptr::NonNull,
         sync::Arc,
-    }
+    },
 };
 
 pub type StrView = View<'static, str>;
@@ -31,13 +31,15 @@ pub struct View<'borrow, T: ?Sized + 'borrow> {
 }
 
 // Safety: `View` is a compressed version of `Result<&T, Arc<T>>`
-unsafe impl<'borrow, T: ?Sized + 'borrow> Send for View<'borrow, T>
-where
-    Result<&'borrow T, Arc<T>>: Send {}
+unsafe impl<'borrow, T: ?Sized + 'borrow> Send for View<'borrow, T> where
+    Result<&'borrow T, Arc<T>>: Send
+{
+}
 // Safety: `View` is a compressed version of `Result<&T, Arc<T>>`
-unsafe impl<'borrow, T: ?Sized + 'borrow> Sync for View<'borrow, T>
-where
-    Result<&'borrow T, Arc<T>>: Sync {}
+unsafe impl<'borrow, T: ?Sized + 'borrow> Sync for View<'borrow, T> where
+    Result<&'borrow T, Arc<T>>: Sync
+{
+}
 
 impl<'borrow, T: ?Sized> From<&'borrow T> for View<'borrow, T> {
     fn from(value: &'borrow T) -> Self {
@@ -48,9 +50,7 @@ impl<'borrow, T: ?Sized> From<&'borrow T> for View<'borrow, T> {
 impl<T: ?Sized> From<Arc<T>> for View<'static, T> {
     fn from(value: Arc<T>) -> Self {
         // Safety: `Arc::into_raw` always returns a non-null pointer
-        let ptr = unsafe {
-            NonNull::new_unchecked(Arc::into_raw(value).cast_mut())
-        };
+        let ptr = unsafe { NonNull::new_unchecked(Arc::into_raw(value).cast_mut()) };
         Self { ptr, off: 0, _covar: PhantomData }
     }
 }
@@ -67,21 +67,33 @@ impl<T> From<Vec<T>> for View<'static, [T]> {
     }
 }
 
-impl From<String> for View<'static, str> {
+impl From<String> for StrView {
     fn from(value: String) -> Self {
         Arc::<str>::from(value).into()
     }
 }
 
-impl From<PathBuf> for View<'static, Path> {
+impl From<OsString> for OsStrView {
+    fn from(value: OsString) -> Self {
+        Arc::<OsStr>::from(value).into()
+    }
+}
+
+impl From<PathBuf> for PathView {
     fn from(value: PathBuf) -> Self {
         Arc::<Path>::from(value).into()
     }
 }
 
+impl<'borrow> From<&'borrow str> for View<'borrow, OsStr> {
+    fn from(value: &'borrow str) -> Self {
+        Self::from(OsStr::new(value))
+    }
+}
+
 impl<T: ?Sized + 'static> Default for View<'_, T>
 where
-    &'static T: Default
+    &'static T: Default,
 {
     fn default() -> Self {
         <&T as Default>::default().into()
@@ -100,9 +112,9 @@ impl<T: ?Sized> Drop for View<'_, T> {
     }
 }
 
-impl<T: ?Sized> AsRef<T> for View<'_, T> {
-    fn as_ref(&self) -> &T {
-        self.deref()
+impl<T: ?Sized + AsRef<U>, U: ?Sized> AsRef<U> for View<'_, T> {
+    fn as_ref(&self) -> &U {
+        self.deref().as_ref()
     }
 }
 
@@ -237,9 +249,14 @@ impl<'borrow> View<'borrow, str> {
         res
     }
 
-    #[expect(clippy::needless_pass_by_value, reason = "use `.by_ref()` to pass by ref")]
+    #[expect(clippy::needless_pass_by_value, reason = "use `.by_ref()` to pass the pattern by ref")]
     pub fn strip_prefix(self, prefix: impl Pattern) -> Result<Self, Self> {
         prefix.immediate_match(self).map(first)
+    }
+
+    #[expect(clippy::needless_pass_by_value, reason = "use `.by_ref()` to pass the pattern by ref")]
+    pub fn trim_start_matches(self, prefix: impl Pattern) -> Self {
+        prefix.immediate_matches(self).0
     }
 
     pub fn lines(self) -> impl FusedIterator<Item = Self> {

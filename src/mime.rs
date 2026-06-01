@@ -1,14 +1,16 @@
-use crate::short_str;
-use crate::utils::ShortStr;
-use anyhow::{bail, Context, Result};
+use std::{ffi::OsStr, path::Path};
+
+use crate::inline_str;
+use crate::utils::InlineStr;
+use anyhow::{Context, Result, bail};
+use reqwest::{Response, Url, blocking, header::HeaderMap};
 use shrimple_parser::tuple::first;
-use ureq::Response;
 
 macro_rules! define_mime_to_ext {
     {$( $variant_str:literal => $ext:literal ),+ $(,)?} => {
-        pub fn mime_to_ext(src: &str) -> Result<ShortStr> {
+        pub fn mime_to_ext(src: &str) -> Result<InlineStr> {
             match src.split_once(['+', ';']).map_or(src, first) {
-                $( $variant_str => Ok(short_str!($ext)), )+
+                $( $variant_str => Ok(inline_str!($ext)), )+
                 _ => bail!("unknown MIME type: {src}"),
             }
         }
@@ -219,15 +221,49 @@ define_mime_to_ext! {
     "application/x-zip-compressed" => ".zip",
 }
 
-/// Returns the file extension most suitable for the content of the HTTP response.
-pub fn remote_file_ext(response: &Response) -> Result<ShortStr> {
-    let path = response.get_url();
-    if let Some(last_dot) = path.rfind('.') {
-        let ext = path.split_at(last_dot).1;
-        ShortStr::new(ext).with_context(|| format!("file extension too long: {ext:?}"))
-    } else {
-        let content_type =
-            response.header("Content-Type").context("no Content-Type header provided")?;
-        mime_to_ext(content_type)
+pub trait ResponseLike {
+    fn url(&self) -> &Url;
+    fn headers(&self) -> &HeaderMap;
+}
+
+impl ResponseLike for Response {
+    fn url(&self) -> &Url {
+        self.url()
     }
+
+    fn headers(&self) -> &HeaderMap {
+        self.headers()
+    }
+}
+
+impl ResponseLike for blocking::Response {
+    fn url(&self) -> &Url {
+        self.url()
+    }
+
+    fn headers(&self) -> &HeaderMap {
+        self.headers()
+    }
+}
+
+pub fn path_extension(path: &str) -> Result<InlineStr> {
+    let res = Path::new(path).extension().and_then(OsStr::to_str).unwrap_or_default();
+    InlineStr::new(res).with_context(|| format!("file extension too long: {res:?}"))
+}
+
+/// Returns the file extension most suitable for the content of the HTTP response.
+pub fn remote_file_ext(response: &impl ResponseLike) -> Result<InlineStr> {
+    let path = response.url().path();
+    let ext = path_extension(path)?;
+    if !ext.is_empty() {
+        return Ok(ext);
+    }
+
+    let content_type = response
+        .headers()
+        .get("Content-Type")
+        .context("no Content-Type header provided")?
+        .to_str()
+        .context("Content-Type is not UTF-8")?;
+    mime_to_ext(content_type)
 }

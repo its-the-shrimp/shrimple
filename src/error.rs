@@ -1,13 +1,14 @@
-use crate::{parser::Expected, view::StrView};
-use shrimple_parser::{
-    utils::{locate_in_multiple, FullLocation, PathLike, WithSourceLine},
-    FullParsingError,
-};
-use std::{
-    backtrace::BacktraceStatus,
-    fmt::{Debug, Display, Formatter, Write},
-    path::Path,
-    sync::Arc,
+use {
+    crate::{asset::Asset, parser::Expected, view::StrView},
+    shrimple_parser::{
+        FullParsingError,
+        utils::{FullLocation, PathLike, WithSourceLine, locate_in_multiple},
+    },
+    std::{
+        backtrace::BacktraceStatus,
+        fmt::{Debug, Display, Formatter, Write},
+        sync::Arc,
+    },
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -34,13 +35,11 @@ impl Display for Expansions {
 
 impl std::error::Error for Expansions {}
 
-pub fn collect_template_expansion_info(
+pub fn collect_template_expansion_info<'asset>(
     error: &anyhow::Error,
-    files: impl IntoIterator<Item = (impl AsRef<Path>, impl AsRef<str>), IntoIter: Clone>,
+    assets: impl IntoIterator<Item = &'asset Asset, IntoIter: Clone>,
 ) -> anyhow::Error {
     let root = error.root_cause();
-    let loc = error.downcast_ref::<ExtraCtx<FullLocation<'static>>>().map(|x| &x.0);
-    let expansions = error.downcast_ref::<Expansions>().map(|x| &x.0);
 
     // the `\r` is prepended to discard the "Error: " that Rust prints before printing an error
     // returned from `main`
@@ -49,18 +48,25 @@ pub fn collect_template_expansion_info(
             err.reason.map_or_else(|| "\rthis is a bug :3".to_owned(), |x| format!("\rerror: {x}")),
             Some(&err.loc),
         ),
-        None => (format!("\rerror: {root}"), loc),
+        None => (
+            format!("\rerror: {root}"),
+            error.downcast_ref::<ExtraCtx<FullLocation<'static>>>().map(|x| &x.0),
+        ),
     };
 
     if let Some(loc) = loc {
         _ = write!(&mut msg, "\n--> {}", WithSourceLine(loc));
     }
 
-    let files = files.into_iter();
+    let assets = assets.into_iter();
+    let expansions = error.downcast_ref::<Expansions>().map(|x| &x.0);
     for name in expansions.iter().flat_map(|x| x.iter().rev()) {
-        _ = write!(&mut msg, "\n\n...while expanding template `<${name}>`"); 
-        if let Some((path, loc)) = locate_in_multiple(name.as_ptr(), files.clone()) {
-            let loc = FullLocation { loc, path: path.as_ref().into_path_bytes() };
+        _ = write!(&mut msg, "\n\n...while expanding template `<${name}>`");
+        if let Some((path, loc)) = locate_in_multiple(
+            name.as_ptr(),
+            assets.clone().filter_map(|asset| Some((&asset.path, asset.src()?))),
+        ) {
+            let loc = FullLocation { loc, path: path.into_path_bytes() };
             _ = write!(&mut msg, "\n--> {}", WithSourceLine(&loc));
         }
     }

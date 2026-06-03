@@ -71,3 +71,9 @@ Is equivalent to this snippet of standard HTML:
     </body>
 </html>
 ```
+
+## Want to know more?
+
+Check out the [docs](docs)
+
+And consider [donating](https://github.com/sponsors/its-the-shrimp) to boost the development of this ambitious little tool 

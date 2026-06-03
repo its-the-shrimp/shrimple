@@ -584,7 +584,8 @@ impl Compiler {
             None => asset.path.clone(),
         };
 
-        if is_ref_element { // `<$ref>`
+        if is_ref_element {
+            // `<$ref>`
             self.lua_ctx.set_var(&var_name, &path_with_fragment)?;
         } else if !not_cached {
             let Some(ref_attr) = element.attr_mut(&var_name) else {
@@ -703,55 +704,57 @@ impl Compiler {
             unreachable!("did not create an `<html>` element")
         };
 
-        let mut extra_children_in_html = Vec::with_capacity(html_element.body.len());
+        let mut extra_children_in_html = Vec::new();
+        let mut head_elements_in_html = Vec::new();
         let mut existing_body_element = None;
         let mut existing_head_element = None;
-        let mut existing_charset_element = None;
         for child in take(&mut html_element.body) {
             match child {
                 XmlNode::Element(x) if x.name == "head" => existing_head_element = Some(x),
                 XmlNode::Element(x) if x.name == "body" => existing_body_element = Some(x),
-                XmlNode::Element(x) if x.name == "meta" && x.attr("charset").is_some() => {
-                    existing_charset_element = Some(x);
+                XmlNode::Element(ref x)
+                    if let "title" | "base" | "link" | "style" | "meta" | "script" | "noscript"
+                    | "template" = &*x.name =>
+                {
+                    head_elements_in_html.push(child);
                 }
                 extra => extra_children_in_html.push(extra),
             }
         }
 
-        let charset_element = match existing_charset_element {
-            Some(existing) => Some(existing),
-            None if existing_head_element.as_ref().is_some_and(|head| {
-                head.subelements("meta").any(|x| x.attr("charset").is_some())
-            }) =>
-            {
-                None
-            }
-            None => Some(XmlElement {
-                name: "meta".into(),
-                attrs: [("charset", Some("UTF-8")).into()].into(),
-                body: default(),
-            }),
-        };
-        let head_element = match existing_head_element {
+        let mut head_element = match existing_head_element {
             Some(mut existing) => {
-                let mut existing_body = take(&mut existing.body).into_vec();
-                existing_body.extend(extra_children_in_html);
-                existing_body.extend(charset_element.map(XmlNode::Element));
-                existing.body = existing_body.into();
+                existing.body = chain(take(&mut existing.body), head_elements_in_html).collect();
                 existing
             }
 
             None => XmlElement {
                 name: "head".into(),
                 attrs: default(),
-                body: chain(charset_element.map(XmlNode::Element), extra_children_in_html)
-                    .collect(),
+                body: head_elements_in_html.into(),
             },
         };
 
-        let body_element = existing_body_element
-            .unwrap_or_else(|| XmlElement { name: "body".into(), ..default() });
-        html_element.body = [head_element, body_element].map(XmlNode::Element).into();
+        if head_element.subelements("meta").all(|meta| meta.attr("charset").is_none()) {
+            head_element.body = chain(
+                [XmlNode::Element(XmlElement {
+                    name: "meta".into(),
+                    attrs: [("charset", Some("UTF-8")).into()].into(),
+                    body: default(),
+                })],
+                take(&mut head_element.body),
+            )
+            .collect();
+        }
+
+        let body_element = existing_body_element.unwrap_or_else(|| XmlElement {
+            name: "body".into(),
+            attrs: default(),
+            body: take(&mut extra_children_in_html).into(),
+        });
+        html_element.body =
+            chain(extra_children_in_html, [head_element, body_element].map(XmlNode::Element))
+                .collect();
     }
 
     pub fn compile(&mut self) -> Result {

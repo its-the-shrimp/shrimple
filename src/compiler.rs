@@ -3,7 +3,7 @@ use {
         asset::AssetManager,
         ast::{AstBuilder, Attr, XmlElement, XmlNode, XmlText},
         error::{Expansions, ExtraCtx, collect_template_expansion_info},
-        parser::XmlTextFragment,
+        parser::{XmlTextFragment, url_scheme},
         utils::{InlineStr, Result, default},
         view::StrView,
     },
@@ -464,7 +464,7 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_register_template_ext(&mut self, element: &mut XmlElement) -> Result {
+    fn compile_register_template_ext_element(&mut self, element: &mut XmlElement) -> Result {
         self.forbid_children_in_element(element)?;
 
         let mut attrs = take(&mut element.attrs).into_vec();
@@ -571,12 +571,26 @@ impl Compiler {
             );
         };
 
+        let not_cached = last_cached_marker.is_none();
+        if not_cached && url_scheme(&path).is_some() {
+            return Ok(());
+        }
         let is_template = last_processing_mode_marker.map(|marker| marker == "$template");
-        let is_local = last_cached_marker.is_none();
-        let asset =
-            self.asset_manager.add_asset(path.trim_start_matches('/'), is_local, is_template)?;
-        if is_ref_element {
-            self.lua_ctx.set_var(&var_name, &asset.path)?;
+
+        let asset = self.asset_manager.add_asset(path.clone(), not_cached, is_template)?;
+
+        let path_with_fragment = match path.split_once('#') {
+            Some((_, fragment)) => format!("{}#{}", asset.path, fragment).into(),
+            None => asset.path.clone(),
+        };
+
+        if is_ref_element { // `<$ref>`
+            self.lua_ctx.set_var(&var_name, &path_with_fragment)?;
+        } else if !not_cached {
+            let Some(ref_attr) = element.attr_mut(&var_name) else {
+                bail!("bug: ref attr `{var_name}` disappeared from `<{}>`", element.name);
+            };
+            ref_attr.value = path_with_fragment.into();
         }
 
         Ok(())
@@ -594,7 +608,7 @@ impl Compiler {
             "$foreach" => self.compile_foreach_element(element)?,
             "$children" => self.compile_children_element(element)?,
             "$raw" => self.compile_raw_element(element)?,
-            "$registerTemplateExt" => self.compile_register_template_ext(element)?,
+            "$registerTemplateExt" => self.compile_register_template_ext_element(element)?,
             "$ref" | "a" | "image" | "use" | "link" | "img" | "script" | "form" => {
                 self.compile_ref_like_element(element)?;
             }
@@ -708,7 +722,10 @@ impl Compiler {
             Some(existing) => Some(existing),
             None if existing_head_element.as_ref().is_some_and(|head| {
                 head.subelements("meta").any(|x| x.attr("charset").is_some())
-            }) => None,
+            }) =>
+            {
+                None
+            }
             None => Some(XmlElement {
                 name: "meta".into(),
                 attrs: [("charset", Some("UTF-8")).into()].into(),
@@ -727,7 +744,8 @@ impl Compiler {
             None => XmlElement {
                 name: "head".into(),
                 attrs: default(),
-                body: chain(charset_element.map(XmlNode::Element), extra_children_in_html).collect(),
+                body: chain(charset_element.map(XmlNode::Element), extra_children_in_html)
+                    .collect(),
             },
         };
 

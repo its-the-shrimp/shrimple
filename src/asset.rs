@@ -151,6 +151,11 @@ impl AssetManager {
         is_local: bool,
         is_template: Option<bool>,
     ) -> Result<&mut Asset> {
+        let mut path_or_url = path_or_url.trim_start_matches('/');
+        if let Some(fragment_start) = path_or_url.find('#') {
+            path_or_url.truncate(fragment_start);
+        }
+
         if let Some(res) = self.assets.iter_mut().find(|asset| asset.path_or_url() == &path_or_url)
         {
             // SAFETY: the fn signature assets correctness, just circumventing borrow checker

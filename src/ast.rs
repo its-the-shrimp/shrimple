@@ -73,8 +73,12 @@ impl Display for XmlElement {
 }
 
 impl XmlElement {
-    pub fn attr(&self, name: &str) -> Option<&Attr> {
+    pub fn attr<'a>(&'a self, name: &str) -> Option<&'a Attr> {
         self.attrs.iter().find(|attr| attr.name == name)
+    }
+
+    pub fn attr_mut<'a>(&'a mut self, name: &str) -> Option<&'a mut Attr> {
+        self.attrs.iter_mut().find(|attr| attr.name == name)
     }
 
     pub fn subelements<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a Self> {
@@ -153,6 +157,12 @@ impl XmlElement {
 #[derive(Debug, Clone, Default)]
 pub struct XmlText {
     pub parts: Box<[XmlTextFragment]>,
+}
+
+impl From<StrView> for XmlText {
+    fn from(value: StrView) -> Self {
+        Self { parts: [XmlTextFragment::Text(value)].into() }
+    }
 }
 
 impl From<&'static str> for XmlText {

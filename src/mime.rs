@@ -252,6 +252,7 @@ pub fn path_extension(path: &str) -> Result<InlineStr> {
 }
 
 /// Returns the file extension most suitable for the content of the HTTP response.
+// TODO: don't make the HEAD request if the file extension is present
 pub fn remote_file_ext(response: &impl ResponseLike) -> Result<InlineStr> {
     let path = response.url().path();
     let ext = path_extension(path)?;

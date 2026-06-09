@@ -1,483 +1,430 @@
+//! Abstract Syntax Tree of an XML document
+
 use {
     crate::{
         asset::Asset,
         error::ExtraCtx,
         escape_html::EscapeHtml,
-        utils::{Result, is_in},
+        lexer::{Lexeme, Lexer, TextLexeme, TextLexer},
+        utils::{Result, default},
         view::StrView,
     },
-    shrimple_parser::{
-        Input, Parser as _, ParsingError, any, from_tuple,
-        pattern::{parse, parse_group, parse_until, parse_until_ex, parse_while},
-        tuple::first,
-        utils::{FullLocation, PathLike, locate},
-    },
+    anyhow::anyhow,
+    pulldown_cmark::{Event, HeadingLevel, Options, Tag},
+    shrimple_parser::utils::{FullLocation, PathLike, locate},
     std::{
-        convert::Infallible,
-        error::Error,
-        fmt::{self, Debug, Display, Formatter},
+        cell::Cell,
+        fmt::{self, Display, Formatter},
+        iter::Peekable,
         mem::take,
-        ptr::null,
     },
 };
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attr {
-    prefix_and_name: StrView,
-    /// Safety: `self.name_start < self.prefix_and_name.len()`
-    name_start: usize,
-    pub value: Option<XmlTextFragment>,
+    pub name: StrView,
+    pub value: Text,
+}
+
+impl From<(&'static str, Option<&'static str>)> for Attr {
+    fn from((name, value): (&'static str, Option<&'static str>)) -> Self {
+        Self { name: name.into(), value: value.map_or_else(default, Into::into) }
+    }
 }
 
 impl Display for Attr {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        if f.alternate() {
-            if let Some(value) = &self.value {
-                write!(f, "{}={value:#}", EscapeHtml(&self.prefix_and_name))
-            } else {
-                Display::fmt(&EscapeHtml(&self.prefix_and_name), f)
-            }
-        } else if let Some(value) = &self.value {
-            write!(f, "{}={value}", self.prefix_and_name)
-        } else {
-            Display::fmt(&self.prefix_and_name, f)
-        }
-    }
-}
-
-impl Attr {
-    pub const fn has_value(&self) -> bool {
-        self.value.is_some()
-    }
-
-    pub fn as_src_ptr(&self) -> *const u8 {
-        self.prefix_and_name.as_ptr()
-    }
-
-    pub fn name(&self) -> &str {
-        &self.prefix_and_name[self.name_start..]
-    }
-
-    pub fn into_parts(self) -> (StrView, Option<XmlTextFragment>) {
-        (self.prefix_and_name.after(self.name_start), self.value)
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-// Safety invariant: `!self.0.is_empty()`
-pub struct OpeningTagEnd(StrView);
-
-impl Display for OpeningTagEnd {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        Display::fmt(&self.0, f)
-    }
-}
-
-impl OpeningTagEnd {
-    /// An opening tag end span that doesn't point to any source code, but that spans `/>`
-    pub fn default_self_closing() -> Self {
-        Self("/>".into())
-    }
-
-    /// An opening tag end span that doesn't point to any source code, but that spans `>`
-    pub fn default_with_children() -> Self {
-        Self(">".into())
-    }
-
-    pub fn as_src_ptr(&self) -> *const u8 {
-        self.0.as_ptr().wrapping_add(self.0.len() - 1 - usize::from(self.0.starts_with("/>")))
-    }
-
-    pub fn is_self_closing(&self) -> bool {
-        self.0.ends_with("/>")
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EvalCmd {
-    AdvanceIter,
-    EndExpansion,
-}
-
-impl Display for EvalCmd {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match self {
-            Self::AdvanceIter => write!(f, "$[__advanceIter]"),
-            Self::EndExpansion => write!(f, "$[__endExpansion]"),
+        f.write_str(" ")?;
+        EscapeHtml(&self.name).fmt(f)?;
+        if !self.value.parts.is_empty() {
+            f.write_str("=\"")?;
+            self.value.fmt(f)?;
+            f.write_str("\"")?;
         }
+        Ok(())
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum XmlTextFragment {
-    /// $VARNAME
-    Var(StrView),
-    /// $(LUA CODE)
-    Expr(StrView),
-    /// any other text
-    Text(StrView),
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Element {
+    /// If empty, only the element's children are printed
+    pub name: StrView,
+    pub attrs: Box<[Attr]>,
+    pub body: Box<[Node]>,
 }
 
-impl Display for XmlTextFragment {
+impl Display for Element {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        if f.alternate() {
-            match self {
-                Self::Var(name) => write!(f, "${}", EscapeHtml(name)),
-                Self::Expr(expr) => write!(f, "$({})", EscapeHtml(expr)),
-                Self::Text(text) => Display::fmt(&EscapeHtml(text), f),
+        if !self.name.is_empty() {
+            write!(f, "<{:#}", EscapeHtml(&self.name))?;
+            self.attrs.iter().try_for_each(|attr| attr.fmt(f))?;
+            match &*self.name {
+                "!DOCTYPE" | "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input"
+                | "link" | "meta" | "param" | "source" | "track" | "wbr" => {
+                    return write!(f, "/>");
+                }
+                _ => (),
             }
-        } else {
-            match self {
-                Self::Var(name) => write!(f, "${name}"),
-                Self::Expr(expr) => write!(f, "$({expr})"),
-                Self::Text(text) => Display::fmt(text, f),
+            write!(f, ">")?;
+        }
+
+        self.body.iter().try_for_each(|child| child.fmt(f))?;
+
+        if !self.name.is_empty() {
+            write!(f, "</{:#}>", EscapeHtml(&self.name))?;
+        }
+        Ok(())
+    }
+}
+
+impl Element {
+    /// Must be at the state <elementName ...
+    ///                                   ^
+    fn parse(
+        name: StrView,
+        iter: &mut Peekable<impl Iterator<Item = Lexeme>>,
+        indent_level: usize,
+        asset: &Asset,
+    ) -> Result<Self> {
+        let mut attrs = Vec::new();
+        let mut children = Vec::new();
+
+        let opening_tag_end = loop {
+            match iter.next() {
+                None => {
+                    return Err(anyhow!("unclosed opening tag")
+                        .context(ExtraCtx(Lexeme::OpeningTagStart(name))));
+                }
+                Some(Lexeme::Attr(attr)) => {
+                    let (name, value) = attr.into_parts();
+                    attrs.push(Attr {
+                        name,
+                        value: Text {
+                            indent_level: 0,
+                            parts: match value {
+                                None => default(),
+                                Some(code @ (TextLexeme::Var(_) | TextLexeme::Expr(_))) => {
+                                    [code].into()
+                                }
+                                Some(TextLexeme::Text(text)) => {
+                                    let result = Cell::new(Ok(()));
+                                    let mut parser = TextLexer::new(text, asset.clone(), &result);
+                                    let parts = parser.by_ref().collect();
+                                    result.into_inner()?;
+                                    parts
+                                }
+                            },
+                        },
+                    });
+                }
+                Some(Lexeme::OpeningTagEnd(opening_tag_end)) => break opening_tag_end,
+                frag => return Err(anyhow!("unexpected input").context(ExtraCtx(frag))),
+            }
+        };
+
+        if !opening_tag_end.is_self_closing() {
+            loop {
+                if let Some(closing_name) = iter.next_if_map(|frag| match frag {
+                    Lexeme::ClosingTag(closing_name) => Ok(closing_name),
+                    frag => Err(frag),
+                }) {
+                    if !closing_name.is_empty() && closing_name != name {
+                        return Err(anyhow!("expected `</{name}>` or `</>`")
+                            .context(ExtraCtx(Lexeme::ClosingTag(closing_name))));
+                    }
+                    break;
+                } else if iter.peek().is_none() {
+                    return Err(anyhow!("unclosed element")
+                        .context(ExtraCtx(Lexeme::OpeningTagStart(name))));
+                }
+
+                children.push(Node::parse(iter, indent_level + 1, asset)?);
             }
         }
-    }
-}
 
-impl XmlTextFragment {
-    pub const fn as_text(&self) -> &StrView {
-        match self {
-            Self::Var(view) | Self::Expr(view) | Self::Text(view) => view,
-        }
+        Ok(Self { name, attrs: attrs.into_boxed_slice(), body: children.into_boxed_slice() })
     }
 
-    pub fn into_text(self) -> StrView {
-        match self {
-            Self::Var(view) | Self::Expr(view) | Self::Text(view) => view,
-        }
-    }
+    fn parse_markdown<'a>(
+        iter: &mut Peekable<impl Iterator<Item = Event<'a>>>,
+        tag: Tag<'a>,
+    ) -> Self {
+        let end_event = Event::End(tag.to_end());
+        let mut attrs = Vec::new();
+        let name = match tag {
+            Tag::Heading { level, .. } => match level {
+                HeadingLevel::H1 => "h1",
+                HeadingLevel::H2 => "h2",
+                HeadingLevel::H3 => "h3",
+                HeadingLevel::H4 => "h4",
+                HeadingLevel::H5 => "h5",
+                HeadingLevel::H6 => "h6",
+            },
 
-    pub fn as_src_ptr(&self) -> *const u8 {
-        match self {
-            Self::Var(s) | Self::Expr(s) | Self::Text(s) => s.as_ptr(),
-        }
-    }
-}
+            Tag::CodeBlock(_) => "code",
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum XmlFragment {
-    /// <tagname
-    OpeningTagStart(StrView),
-    /// `key=value` or key
-    Attr(Attr),
-    /// `/>` or `>`
-    OpeningTagEnd(OpeningTagEnd),
-    /// </tagname>
-    ClosingTag(StrView),
-    /// $VARNAME / $(LUA CODE) / any other text
-    Text(XmlTextFragment),
-    /// used by the evaluator
-    Internal(EvalCmd),
-}
+            Tag::List(count_from) => match count_from {
+                Some(count_from) => {
+                    if count_from != 1 {
+                        attrs.push(Attr {
+                            name: "start".into(),
+                            value: count_from.to_string().into(),
+                        });
+                    }
+                    "ol"
+                }
+                None => "ul",
+            },
 
-impl Display for XmlFragment {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        if f.alternate() {
-            match self {
-                Self::OpeningTagStart(name) => write!(f, "&lt;{}", EscapeHtml(name)),
-                Self::Attr(attr) => write!(f, "{attr:#}"),
-                Self::OpeningTagEnd(s) => write!(f, "{s:#}"),
-                Self::ClosingTag(name) => write!(f, "&lt;/{}&gt;", EscapeHtml(name)),
-                Self::Text(textlike) => write!(f, "{textlike:#}"),
-                Self::Internal(i) => write!(f, "$__internal({i})"),
+            Tag::Item => "li",
+
+            Tag::Table(_ /* TODO: account for alignment */) => "table",
+
+            Tag::TableHead => "thead",
+
+            Tag::TableRow => "tr",
+
+            Tag::TableCell => "td",
+
+            Tag::Emphasis => "em",
+
+            Tag::Strong => "b",
+
+            Tag::Strikethrough => "s",
+
+            Tag::Link { dest_url, title, .. } => {
+                if !title.is_empty() {
+                    attrs.push(Attr { name: "title".into(), value: String::from(title).into() });
+                }
+                attrs.push(Attr { name: "href".into(), value: String::from(dest_url).into() });
+                "a"
             }
-        } else {
-            match self {
-                Self::OpeningTagStart(name) => write!(f, "<{name}"),
-                Self::Attr(attr) => write!(f, "{attr}"),
-                Self::OpeningTagEnd(s) => write!(f, "{s}"),
-                Self::ClosingTag(name) => write!(f, "</{name}>"),
-                Self::Text(textlike) => write!(f, "{textlike}"),
-                Self::Internal(i) => write!(f, "$__internal({i})"),
+
+            Tag::Image { dest_url, title, .. } => {
+                attrs.push(Attr { name: "src".into(), value: String::from(dest_url).into() });
+                if !title.is_empty() {
+                    attrs.push(Attr { name: "title".into(), value: String::from(title).into() });
+                }
+                "img"
             }
+
+            _ => "",
+        };
+        let mut body = Vec::new();
+
+        while iter.next_if_eq(&end_event).is_none() {
+            body.push(Node::parse_markdown(iter));
+        }
+        if name == "img" && !body.is_empty() {
+            attrs.push(Attr {
+                name: "alt".into(),
+                value: format!("{:#}", Self { body: take(&mut body).into(), ..default() }).into(),
+            });
+        }
+
+        Self { name: name.into(), attrs: attrs.into(), body: body.into() }
+    }
+
+    pub fn attr<'a>(&'a self, name: &str) -> Option<&'a Attr> {
+        self.attrs.iter().find(|attr| attr.name == name)
+    }
+
+    pub fn attr_mut<'a>(&'a mut self, name: &str) -> Option<&'a mut Attr> {
+        self.attrs.iter_mut().find(|attr| attr.name == name)
+    }
+
+    pub fn subelements<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a Self> {
+        self.body.iter().filter_map(move |x| x.as_element(name))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Text {
+    pub parts: Box<[TextLexeme]>,
+    pub indent_level: usize,
+}
+
+impl From<StrView> for Text {
+    fn from(value: StrView) -> Self {
+        Self { parts: [TextLexeme::Text(value)].into(), indent_level: 0 }
+    }
+}
+
+impl From<&'static str> for Text {
+    fn from(value: &'static str) -> Self {
+        Self { parts: [TextLexeme::Text(value.into())].into(), indent_level: 0 }
+    }
+}
+
+impl From<String> for Text {
+    fn from(value: String) -> Self {
+        Self { parts: [TextLexeme::Text(value.into())].into(), indent_level: 0 }
+    }
+}
+
+impl Display for Text {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        self.parts.iter().try_for_each(|part| part.fmt(f))
+    }
+}
+
+impl Text {
+    fn parse(iter: &mut Peekable<impl Iterator<Item = Lexeme>>, indent_level: usize) -> Self {
+        let mut parts = Vec::new();
+
+        while let Some(frag) = iter.next_if_map(|frag| match frag {
+            Lexeme::Text(text_frag) => Ok(text_frag),
+            other => Err(other),
+        }) {
+            parts.push(frag);
+        }
+
+        Self { parts: parts.into_boxed_slice(), indent_level }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Node {
+    Element(Element),
+    Text(Text),
+}
+
+impl Default for Node {
+    fn default() -> Self {
+        Self::Text(default())
+    }
+}
+
+impl From<StrView> for Node {
+    fn from(value: StrView) -> Self {
+        Self::Text(Text::from(value))
+    }
+}
+
+impl From<Vec<Self>> for Node {
+    fn from(value: Vec<Self>) -> Self {
+        match <[Self; 1]>::try_from(value) {
+            Ok([only]) => only,
+            Err(multiple) => Self::Element(Element { body: multiple.into(), ..default() }),
         }
     }
 }
 
-impl XmlFragment {
-    // TODO: do normal spans
-    /// For error reporting
-    pub fn as_src_ptr(&self) -> *const u8 {
-        match self {
-            Self::Attr(attr) => attr.as_src_ptr(),
-            Self::OpeningTagEnd(tag) => tag.as_src_ptr(),
-            Self::Text(textlike) => textlike.as_src_ptr(),
-            Self::OpeningTagStart(s) | Self::ClosingTag(s) => s.as_ptr(),
-            Self::Internal(_) => null(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Expected {
-    ClosedTag,
-    Word,
-    StrLiteral,
-    TemplateExpr,
-    TemplateVarName,
-    AttrName,
-    Comment,
-}
-
-impl Display for Expected {
+impl Display for Node {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ClosedTag => write!(f, "expected `/>` or `>`"),
-            Self::Word => write!(f, "expected a word terminated by whitespace, `/>` or `>`"),
-            Self::StrLiteral => write!(f, "expected a string terminated by `\"`"),
-            Self::TemplateExpr => write!(f, "expected an expression terminated by `)`"),
-            Self::TemplateVarName => write!(f, "expected a variable name"),
-            Self::AttrName => write!(f, "expected an attribute name"),
-            Self::Comment => write!(f, "expected a comment terminated by `-->`"),
+            Self::Element(element) => element.fmt(f),
+            Self::Text(text) => text.fmt(f),
         }
     }
 }
 
-impl Error for Expected {}
+impl Node {
+    fn parse(
+        iter: &mut Peekable<impl Iterator<Item = Lexeme>>,
+        indent_level: usize,
+        asset: &Asset,
+    ) -> Result<Self> {
+        if let Some(name) = iter.next_if_map(|lexeme| match lexeme {
+            Lexeme::OpeningTagStart(name) => Ok(name),
+            frag => Err(frag),
+        }) {
+            Element::parse(name, iter, indent_level, asset).map(Self::Element)
+        } else {
+            Ok(Self::Text(Text::parse(iter, indent_level)))
+        }
+    }
 
-impl From<Infallible> for Expected {
-    fn from(value: Infallible) -> Self {
-        match value {}
+    fn parse_markdown<'a>(iter: &mut Peekable<impl Iterator<Item = Event<'a>>>) -> Self {
+        loop {
+            let Some(event) = iter.next() else {
+                return default();
+            };
+            break match event {
+                Event::Start(tag) => Self::Element(Element::parse_markdown(iter, tag)),
+                Event::Text(text) => Self::Text(Text::from(StrView::from_str(&text))),
+                Event::Code(code) => Self::Element(Element {
+                    name: "code".into(),
+                    attrs: default(),
+                    body: [StrView::from_str(&code).into()].into(),
+                }),
+                Event::SoftBreak | Event::HardBreak => {
+                    Self::Element(Element { name: "br".into(), ..default() })
+                }
+                Event::Rule => Self::Element(Element { name: "hr".into(), ..default() }),
+                _ => continue,
+            };
+        }
+    }
+
+    pub fn as_element<'a>(&'a self, name: &str) -> Option<&'a Element> {
+        match self {
+            Self::Element(element) => (element.name == name).then_some(element),
+            Self::Text(_) => None,
+        }
     }
 }
 
-fn wrap_parsing_error(e: &ParsingError<impl Input, Expected>, asset: &Asset) -> anyhow::Error {
-    let res = match e.reason {
-        Some(reason) => anyhow::Error::new(reason),
-        None => anyhow::Error::msg("bug: parsing error without reason"),
-    };
-
-    let Some(loc) = asset.template_src().and_then(|src| locate(e.rest.as_ptr(), src)) else {
-        return res;
-    };
-
-    res.context(ExtraCtx(FullLocation { path: asset.path.to_string().into_path_bytes(), loc }))
+pub struct HtmlParser<'a> {
+    iter: Peekable<Lexer<'a>>,
+    asset: &'a Asset,
+    result: &'a Cell<Result>,
 }
 
-type ParsingResult<T = (), E = Expected> = shrimple_parser::ParsingResult<StrView, T, E>;
-
-#[expect(clippy::trivially_copy_pass_by_ref, reason = "easier to pass through parsers")]
-fn is_ident_char(ch: &char) -> bool {
-    ch.is_alphanumeric() || ":_-$".contains(*ch)
-}
-
-fn parse_word(input: StrView) -> ParsingResult<StrView> {
-    parse_until(is_in([' ', '\n', '\t', '/', '>'])).expect(Expected::Word)(input)
-}
-
-fn parse_whitespace(input: StrView) -> ParsingResult<StrView, Infallible> {
-    parse_while(char::is_ascii_whitespace)(input)
-}
-
-/// Recoverable if no initial double quote found
-fn parse_string_literal(input: StrView) -> ParsingResult<StrView> {
-    parse('"')
-        .map_reason(|x| match x {})
-        .then(parse_until_ex('"').expect(Expected::StrLiteral))
-        .parse(input)
-}
-
-/// Recoverable if no initial "$(" found
-fn parse_template_expr(input: StrView) -> ParsingResult<StrView> {
-    parse('$')
-        .map_reason(|x| match x {})
-        .then(parse_group('(', ')').map_reason(|_| Expected::TemplateExpr))
-        .parse(input)
-}
-
-fn parse_template_var(input: StrView) -> ParsingResult<StrView> {
-    parse('$')
-        .map_reason(|x| match x {})
-        .then(
-            parse_while(is_ident_char)
-                .filter(|s: &StrView| !s.is_empty())
-                .expect(Expected::TemplateVarName),
-        )
-        .parse(input)
-}
-
-fn parse_xml_text_fragment(input: StrView) -> ParsingResult<XmlTextFragment> {
-    any! {
-        parse_template_expr.map(XmlTextFragment::Expr),
-        parse_template_var.map(XmlTextFragment::Var),
-        parse_until('$').map(XmlTextFragment::Text).map_reason(|x| match x {}),
-        else: XmlTextFragment::Text
-    }
-    .parse(input)
-}
-
-fn parse_attr_value(input: StrView) -> ParsingResult<XmlTextFragment> {
-    any! {
-        parse_template_expr.map(XmlTextFragment::Expr),
-        parse_template_var.map(XmlTextFragment::Var),
-        parse_string_literal.map(XmlTextFragment::Text),
-        parse_word.map(XmlTextFragment::Text),
-    }
-    .parse(input)
-}
-
-fn parse_attr(input: StrView) -> ParsingResult<Attr> {
-    parse_whitespace
-        .map(|s| s.len())
-        .skip(parse_while(is_ident_char).filter(|s: &StrView| !s.is_empty()))
-        .expect(Expected::AttrName)
-        .get_span()
-        .add(parse('=').map_reason(|x| match x {}).then(parse_attr_value).maybe())
-        .map(from_tuple!(Attr { name_start, prefix_and_name, value }))
-        .parse(input)
-}
-
-/// The output is the element name, without the `<`.
-/// Recoverable if no initial `<` is found.
-fn parse_opening_tag_start(input: StrView) -> ParsingResult<StrView> {
-    parse('<').map_reason(|x| match x {}).then(parse_word)(input)
-}
-
-/// Any returned error is recoverable.
-fn parse_opening_tag_end(input: StrView) -> ParsingResult<OpeningTagEnd, Infallible> {
-    parse_whitespace
-        .skip(parse('/'))
-        .and(parse('>'))
-        .get_span()
-        .map(|(.., span)| OpeningTagEnd(span))
-        .parse(input)
-}
-
-/// Recoverable if no initial `<!--` is found.
-fn parse_comment(input: StrView) -> ParsingResult<StrView> {
-    parse("<!--")
-        .map_reason(|x| match x {})
-        .then(parse_until_ex("-->").expect(Expected::Comment))
-        .parse(input)
-}
-
-fn parse_closing_tag(input: StrView) -> ParsingResult<StrView> {
-    parse("</")
-        .map_reason(|x| match x {})
-        .then(parse_word)
-        .skip(parse_whitespace.map_reason(|x| match x {}))
-        .skip(parse('>').expect(Expected::ClosedTag))
-        .parse(input)
-}
-
-fn parse_xml_fragment(input: StrView) -> ParsingResult<XmlFragment> {
-    parse_comment
-        .repeat()
-        .then(any! {
-            parse_closing_tag.map(XmlFragment::ClosingTag),
-            parse_opening_tag_start.map(XmlFragment::OpeningTagStart),
-            parse_template_expr.map(XmlTextFragment::Expr).map(XmlFragment::Text),
-            parse_template_var.map(XmlTextFragment::Var).map(XmlFragment::Text),
-            parse_until(is_in(['$', '<'])).map(XmlTextFragment::Text).map(XmlFragment::Text)
-                .map_reason(|x| match x {}),
-            else: |x| XmlFragment::Text(XmlTextFragment::Text(x))
-        })
-        .parse(input)
-}
-
-fn parse_xml_fragment_in_opening_tag(input: StrView) -> ParsingResult<XmlFragment> {
-    parse_opening_tag_end
-        .map_reason(|x| match x {})
-        .map(XmlFragment::OpeningTagEnd)
-        .or(parse_attr.map(XmlFragment::Attr))
-        .parse(input)
-}
-
-/// Parses only text & yields [`XmlTextFragment`]s
-pub struct TextParser {
-    asset: Asset,
-    input: StrView,
-    error: Result,
-}
-
-impl Iterator for TextParser {
-    type Item = XmlTextFragment;
+impl Iterator for HtmlParser<'_> {
+    type Item = Node;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.error.is_err() || self.input.is_empty() {
-            return None;
-        }
-
-        match parse_xml_text_fragment(take(&mut self.input)) {
-            Ok((rest, res)) => {
-                self.input = rest;
-                Some(res)
-            }
-            Err(e) => {
-                self.error = Err(wrap_parsing_error(&e, &self.asset));
-                None
-            }
-        }
+        self.iter.peek()?;
+        Node::parse(&mut self.iter, 0, self.asset)
+            .map_err(|e| {
+                self.result.set('e: {
+                    let Some(ExtraCtx(lexeme)) = e.downcast_ref::<ExtraCtx<Lexeme>>() else {
+                        break 'e Err(e);
+                    };
+                    let Some(src) = self.asset.template_src() else {
+                        break 'e Err(e);
+                    };
+                    let Some(loc) = locate(lexeme.as_src_ptr(), src) else {
+                        break 'e Err(e);
+                    };
+                    Err(e.context(ExtraCtx(FullLocation {
+                        path: self.asset.path.to_string().into_path_bytes(),
+                        loc,
+                    })))
+                });
+            })
+            .ok()
     }
 }
 
-impl TextParser {
-    pub const fn new(input: StrView, asset: Asset) -> Self {
-        Self { input, asset, error: Ok(()) }
-    }
-
-    pub const fn asset(&self) -> &Asset {
-        &self.asset
-    }
-
-    /// returns
-    pub fn finish(self) -> Result {
-        self.error
+impl<'a> HtmlParser<'a> {
+    pub fn new(src: StrView, asset: &'a Asset, result: &'a Cell<Result>) -> Self {
+        let lexer = Lexer::new(src, asset.clone(), result);
+        Self { iter: lexer.peekable(), asset, result }
     }
 }
 
-/// Parses text & HTML elements
-pub struct Parser {
-    asset: Asset,
-    input: StrView,
-    parsing_attrs: bool,
-    error: Result,
+pub struct MarkdownParser<'a> {
+    inner: Peekable<pulldown_cmark::Parser<'a>>,
 }
 
-impl Iterator for Parser {
-    type Item = XmlFragment;
+impl Iterator for MarkdownParser<'_> {
+    type Item = Node;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.error.is_err() || self.input.is_empty() {
-            return None;
-        }
-
-        let input = take(&mut self.input);
-        match if self.parsing_attrs {
-            parse_xml_fragment_in_opening_tag(input)
-        } else {
-            parse_xml_fragment(input)
-        } {
-            Ok((rest, res)) => {
-                self.input = rest;
-                self.parsing_attrs =
-                    matches!(res, XmlFragment::OpeningTagStart(_) | XmlFragment::Attr(_));
-                Some(res)
-            }
-            Err(e) => {
-                self.error = Err(wrap_parsing_error(&e, &self.asset));
-                None
-            }
-        }
+        self.inner.peek().is_some().then(|| Node::parse_markdown(&mut self.inner))
     }
 }
 
-impl Parser {
-    pub const fn new(input: StrView, asset: Asset) -> Self {
-        Self { input, asset, parsing_attrs: false, error: Ok(()) }
+impl<'a> MarkdownParser<'a> {
+    pub fn new(input: &'a str) -> Self {
+        Self {
+            inner: pulldown_cmark::Parser::new_ext(
+                input,
+                Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH,
+            )
+            .peekable(),
+        }
     }
-
-    pub const fn asset(&self) -> &Asset {
-        &self.asset
-    }
-
-    pub fn finish(self) -> Result {
-        self.error
-    }
-}
-
-pub fn url_scheme(url: &str) -> Option<&str> {
-    url.split_once("://").map(first)
 }

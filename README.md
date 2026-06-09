@@ -42,7 +42,7 @@ you can cache it! just prefix the attribute containing the link with `$cached`, 
 The CLI comes with a very handy flag: call `shrimple -w` or `shrimple --watch` to spin up a lightweight local server
 that'll recompile your website as needed and show it to you right in the browser.
 
-### 5. Utilise saner HTML
+### 5. Utilise saner HTML with a sprinkle of Markdown
 The subset of HTML accepted by `shrimple` is intended to smoothe out irregularities & verbosity of
 the standard HTML. The changes that make it shrimple are:
 - No syntactical difference between normal and [void](https://developer.mozilla.org/en-US/docs/Glossary/Void_element) elements:
@@ -52,28 +52,29 @@ all elements can be self-closing, and most can also end in a closing tag.
 - No need for top-level `<html>`, `<head>` or `<body>`: they're inserted automatically
 into the compiled HTML.
 - The encoding of the document is automatically set to UTF-8.
+- Markdown in text nodes is compiled to HTML
 
 This snippet of shrimple HTML:
 ```html
 <title>Hello World</>
-Hello World
+## Hello, *World*!
 ```
 Is equivalent to this snippet of standard HTML:
 ```html
-<!DOCTYPE html>
+<!DOCTYPE html/>
 <html>
     <head>
+        <meta charset="UTF-8"/>
         <title>Hello World</title>
-        <meta charset="UTF-8">
     </head>
     <body>
-        Hello World
+        <h2>Hello, <em>World</em>!</h2>
     </body>
 </html>
 ```
 
 ## Want to know more?
 
-Check out the [docs](docs)
+Check out the [docs](docs/)
 
 And consider [donating](https://github.com/sponsors/its-the-shrimp) to boost the development of this ambitious little tool 

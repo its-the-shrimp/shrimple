@@ -1,19 +1,26 @@
-use core::slice;
-use std::borrow::Cow;
-use std::cmp::Ordering;
-use std::ffi::OsStr;
-use std::fmt::{self, Debug, Display, Formatter, Write};
-use std::iter::FusedIterator;
-use std::mem::transmute;
-use std::ops::Deref;
-use std::path::Path;
-use std::ptr::copy_nonoverlapping;
-use std::str::from_utf8_unchecked;
+#![allow(dead_code)]
+
+use std::{
+    borrow::Cow,
+    cmp::Ordering,
+    ffi::OsStr,
+    fmt::{self, Debug, Display, Formatter, Write},
+    mem::transmute,
+    ops::Deref,
+    path::Path,
+    ptr::copy_nonoverlapping,
+    slice,
+    str::from_utf8_unchecked,
+};
 
 pub type Result<T = (), E = anyhow::Error> = std::result::Result<T, E>;
 
 pub fn is_in<T: Eq>(items: impl AsRef<[T]>) -> impl Fn(&T) -> bool {
     move |item| items.as_ref().contains(item)
+}
+
+pub const fn copy<T: Copy>(x: &T) -> T {
+    *x
 }
 
 /// Exists to compare/print strings as if they had an additional char `P` before them, without
@@ -66,11 +73,24 @@ impl BoolExt for bool {
 
 pub trait OptionExt<T> {
     fn try_map<U, E>(self, f: impl FnOnce(T) -> Result<U, E>) -> Result<Option<U>, E>;
+    fn display(&self) -> impl Display + '_
+    where
+        T: Display;
 }
 
 impl<T> OptionExt<T> for Option<T> {
     fn try_map<U, E>(self, f: impl FnOnce(T) -> Result<U, E>) -> Result<Option<U>, E> {
         self.map(f).transpose()
+    }
+
+    fn display(&self) -> impl Display + '_
+    where
+        T: Display,
+    {
+        fmt::from_fn(|f| match self {
+            Some(x) => x.fmt(f),
+            None => Ok(()),
+        })
     }
 }
 
@@ -214,198 +234,18 @@ impl<const CAP: usize> InlineStr<CAP> {
     }
 }
 
-#[cfg(windows)]
-pub fn soft_link(original: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io::Result<()> {
-    std::fs::hard_link(original, link)
-}
-
-#[cfg(unix)]
-pub fn soft_link(original: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(original, link)
-}
-
-pub fn rel_link_to_file_path(link: &str) -> Cow<'_, Path> {
-    let normalised: &Path = link
+pub fn rel_link_to_file_path(link: &str) -> Cow<'_, str> {
+    let normalised = link
         .split_once('#')
-        .map_or(link, |(path, _query)| path) // removing the fragment
-        .trim_start_matches('/') // ensuring the path is relative
-        .as_ref();
-    if normalised.as_os_str().is_empty() {
-        return Cow::Borrowed("index.html".as_ref());
-    }
-    match normalised.extension() {
-        Some(_) => Cow::Borrowed(normalised),
-        None => Cow::Owned(normalised.with_extension("html")),
-    }
-}
+        .map_or(link, |(path, _frag)| path) // removing the fragment
+        .trim_start_matches('/'); // ensuring the path is relative
 
-/// Copied from the std just to have [`Peekable::inner`] & [`Peekable::into_inner`] methods
-// TODO: make a PR to add this to the std
-pub struct Peekable<I: Iterator> {
-    iter: I,
-    /// Remember a peeked value, even if it was None.
-    #[expect(clippy::option_option)]
-    peeked: Option<Option<I::Item>>,
-}
-
-impl<I: Iterator> Peekable<I> {
-    pub const fn new(iter: I) -> Self {
-        Self { iter, peeked: None }
-    }
-}
-
-// Peekable must remember if a None has been seen in the `.peek()` method.
-// It ensures that `.peek(); .peek();` or `.peek(); .next();` only advances the
-// underlying iterator at most once. This does not by itself make the iterator
-// fused.
-impl<I: Iterator> Iterator for Peekable<I> {
-    type Item = I::Item;
-
-    fn next(&mut self) -> Option<I::Item> {
-        match self.peeked.take() {
-            Some(v) => v,
-            None => self.iter.next(),
-        }
+    if normalised.is_empty() {
+        return Cow::Borrowed("index.html");
     }
 
-    fn count(mut self) -> usize {
-        match self.peeked.take() {
-            Some(None) => 0,
-            Some(Some(_)) => 1 + self.iter.count(),
-            None => self.iter.count(),
-        }
-    }
-
-    fn nth(&mut self, n: usize) -> Option<I::Item> {
-        match self.peeked.take() {
-            Some(None) => None,
-            Some(v @ Some(_)) if n == 0 => v,
-            Some(Some(_)) => self.iter.nth(n - 1),
-            None => self.iter.nth(n),
-        }
-    }
-
-    fn last(mut self) -> Option<I::Item> {
-        let peek_opt = match self.peeked.take() {
-            Some(None) => return None,
-            Some(v) => v,
-            None => None,
-        };
-        self.iter.last().or(peek_opt)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let peek_len = match self.peeked {
-            Some(None) => return (0, Some(0)),
-            Some(Some(_)) => 1,
-            None => 0,
-        };
-        let (lo, hi) = self.iter.size_hint();
-        let lo = lo.saturating_add(peek_len);
-        let hi = match hi {
-            Some(x) => x.checked_add(peek_len),
-            None => None,
-        };
-        (lo, hi)
-    }
-
-    fn fold<Acc, Fold: FnMut(Acc, Self::Item) -> Acc>(self, init: Acc, mut fold: Fold) -> Acc {
-        let acc = match self.peeked {
-            Some(None) => return init,
-            Some(Some(v)) => fold(init, v),
-            None => init,
-        };
-        self.iter.fold(acc, fold)
-    }
-}
-
-impl<I: DoubleEndedIterator> DoubleEndedIterator for Peekable<I> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        match self.peeked.as_mut() {
-            Some(v @ Some(_)) => self.iter.next_back().or_else(|| v.take()),
-            Some(None) => None,
-            None => self.iter.next_back(),
-        }
-    }
-
-    fn rfold<Acc, Fold: FnMut(Acc, Self::Item) -> Acc>(self, init: Acc, mut fold: Fold) -> Acc {
-        match self.peeked {
-            Some(None) => init,
-            Some(Some(v)) => {
-                let acc = self.iter.rfold(init, &mut fold);
-                fold(acc, v)
-            }
-            None => self.iter.rfold(init, fold),
-        }
-    }
-}
-
-impl<I: ExactSizeIterator> ExactSizeIterator for Peekable<I> {}
-
-impl<I: FusedIterator> FusedIterator for Peekable<I> {}
-
-impl<I: Iterator> Peekable<I> {
-    /// The only reason I've copied this impl
-    pub const fn inner(&self) -> &I {
-        &self.iter
-    }
-
-    pub fn into_inner(self) -> I {
-        self.iter
-    }
-
-    pub fn peek(&mut self) -> Option<&I::Item> {
-        let iter = &mut self.iter;
-        self.peeked.get_or_insert_with(|| iter.next()).as_ref()
-    }
-
-    pub fn peek_mut(&mut self) -> Option<&mut I::Item> {
-        let iter = &mut self.iter;
-        self.peeked.get_or_insert_with(|| iter.next()).as_mut()
-    }
-
-    pub fn next_if(&mut self, func: impl FnOnce(&I::Item) -> bool) -> Option<I::Item> {
-        match self.next() {
-            Some(matched) if func(&matched) => Some(matched),
-            other => {
-                // Since we called `self.next()`, we consumed `self.peeked`.
-                assert!(self.peeked.is_none());
-                self.peeked = Some(other);
-                None
-            }
-        }
-    }
-
-    pub fn next_if_eq<T: ?Sized>(&mut self, expected: &T) -> Option<I::Item>
-    where
-        I::Item: PartialEq<T>,
-    {
-        self.next_if(|next| next == expected)
-    }
-
-    pub fn next_if_map<R>(&mut self, f: impl FnOnce(I::Item) -> Result<R, I::Item>) -> Option<R> {
-        let unpeek = if let Some(item) = self.next() {
-            match f(item) {
-                Ok(result) => return Some(result),
-                Err(item) => Some(item),
-            }
-        } else {
-            None
-        };
-        self.peeked = Some(unpeek);
-        None
-    }
-
-    pub fn next_if_map_mut<R>(&mut self, f: impl FnOnce(&mut I::Item) -> Option<R>) -> Option<R> {
-        let unpeek = if let Some(mut item) = self.next() {
-            match f(&mut item) {
-                Some(result) => return Some(result),
-                None => Some(item),
-            }
-        } else {
-            None
-        };
-        self.peeked = Some(unpeek);
-        None
+    match Path::new(normalised).extension() {
+        None if !normalised.ends_with('/') => Cow::Owned(format!("{normalised}.html")),
+        _ => Cow::Borrowed(normalised),
     }
 }

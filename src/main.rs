@@ -1,8 +1,8 @@
 mod asset;
-mod ast;
 mod compiler;
 mod error;
 mod escape_html;
+mod lexer;
 mod mime;
 mod parser;
 mod utils;

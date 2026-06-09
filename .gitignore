@@ -1,4 +1,3 @@
 /target
-/tests
-/dist
-tests.md
+**/dist
+/tests-old

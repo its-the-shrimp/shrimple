@@ -1,5 +1,5 @@
 use {
-    crate::{asset::Asset, parser::Expected, view::StrView},
+    crate::{asset::Asset, lexer::Expected, view::StrView},
     shrimple_parser::{
         FullParsingError,
         utils::{FullLocation, PathLike, WithSourceLine, locate_in_multiple},

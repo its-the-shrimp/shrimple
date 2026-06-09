@@ -19,6 +19,13 @@ notify = "6"
 reqwest = { version = "0.13", features = ["blocking", "gzip", "deflate", "brotli"] }
 tokio = { version = "1", features = ["fs", "rt", "macros"] }
 futures-util = { version = "0.3", default-features = false }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+
+[build-dependencies]
+anyhow = "1"
+
+[features]
+regen-tests = []
 
 [lints.clippy]
 unit_arg = "allow"

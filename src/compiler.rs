@@ -1,24 +1,25 @@
 use {
     crate::{
-        asset::AssetManager,
-        ast::{AstBuilder, Attr, XmlElement, XmlNode, XmlText},
+        asset::{Asset, AssetCategory, AssetManager},
         error::{Expansions, ExtraCtx, collect_template_expansion_info},
-        parser::{XmlTextFragment, url_scheme},
-        utils::{InlineStr, Result, default},
+        lexer::{TextLexeme, TextLexer, url_scheme},
+        parser::{Attr, Element, HtmlParser, MarkdownParser, Node, Text},
+        utils::{InlineStr, OptionExt, Result, default, rel_link_to_file_path},
         view::StrView,
     },
     anyhow::{Context, anyhow, bail, ensure},
-    mlua::{FromLua, Integer, Lua, Value},
+    mlua::{FromLua, Lua, Value},
     shrimple_parser::{
         Input,
         utils::{FullLocation, PathLike},
     },
     std::{
+        cell::Cell,
+        cmp::min,
         fmt::Write,
         fs::read_dir,
         iter::chain,
         mem::{replace, take},
-        ops::Not,
         path::Path,
         sync::Arc,
     },
@@ -49,25 +50,6 @@ impl LuaCtx {
 
     fn set_var(&self, name: &str, value: &str) -> mlua::Result<()> {
         self.inner.globals().set(name, value)
-    }
-
-    fn remove_var(&self, name: &str) -> mlua::Result<()> {
-        self.inner.globals().set(name, Value::Nil)
-    }
-
-    /// if the variable is `nil`, it's set to 0
-    fn increment_var(&self, name: &str) -> Result {
-        let globals = self.inner.globals();
-        globals.set(
-            name,
-            match globals.raw_get(name)? {
-                Value::Nil => 0,
-                val => Integer::from_lua(val, &self.inner)?
-                    .checked_add(1)
-                    .with_context(|| format!("integer overflow while incrementing `{name}`"))?,
-            },
-        )?;
-        Ok(())
     }
 
     fn with_eval_result<R>(&self, code: &str, f: impl FnOnce(&str) -> R) -> mlua::Result<R> {
@@ -103,7 +85,7 @@ struct Template {
     accepts_children: bool,
     /// Sorted by name
     params: Box<[Param]>,
-    body: Box<[XmlNode]>,
+    body: Box<[Node]>,
 }
 
 impl Template {
@@ -117,7 +99,7 @@ impl Template {
 
 struct TemplateExpansion {
     template_name_in_invoc: StrView,
-    body: Box<[XmlNode]>,
+    body: Box<[Node]>,
 }
 
 struct Compiler {
@@ -132,6 +114,9 @@ struct Compiler {
 }
 
 impl Compiler {
+    // TODO: make customisable
+    const SPACES_PER_INDENT: usize = 4;
+
     fn new() -> Self {
         Self {
             is_top_level: false,
@@ -143,46 +128,41 @@ impl Compiler {
         }
     }
 
-    fn compile_text_fragment(
-        &mut self,
-        fragment: &XmlTextFragment,
-        dst: &mut String,
-    ) -> Result<()> {
+    fn compile_text_lexeme(&mut self, fragment: &TextLexeme, dst: &mut String) -> Result<()> {
         match fragment {
-            XmlTextFragment::Var(name) => {
+            TextLexeme::Var(name) => {
                 self.error_ctx_frag = Some(name.clone());
                 self.lua_ctx.with_var(name, |v| dst.write_str(v))??;
             }
-            XmlTextFragment::Expr(code) => {
+            TextLexeme::Expr(code) => {
                 self.error_ctx_frag = Some(code.clone());
                 self.lua_ctx.with_eval_result(code, |res| dst.write_str(res))??;
             }
-            XmlTextFragment::Text(text) => dst.write_str(text)?,
+            TextLexeme::Text(text) => dst.write_str(text)?,
         }
 
         Ok(())
     }
 
-    fn compile_text_node(&mut self, node: &mut XmlText) -> Result {
+    fn compile_text_node(&mut self, node: &mut Text) -> Result {
         if node.parts.is_empty() {
             return Ok(());
         }
 
-        let mut res_md = String::new();
+        let mut res = String::new();
         for part in take(&mut node.parts) {
-            self.compile_text_fragment(&part, &mut res_md).inspect_err(|_| {
+            self.compile_text_lexeme(&part, &mut res).inspect_err(|_| {
                 self.error_ctx_frag = Some(part.into_text());
             })?;
         }
-        // TODO: Markdown to HTML
-        node.parts = [XmlTextFragment::Text(res_md.into())].into();
+        node.parts = [TextLexeme::Text(res.into())].into();
         Ok(())
     }
 
     fn get_required_compiled_attr_value<'dst>(
         &mut self,
         name: &StrView,
-        mut src: XmlText,
+        mut src: Text,
         dst: &'dst mut Option<StrView>,
     ) -> Result<&'dst mut StrView> {
         ensure!(dst.is_none(), "`{name}` attribute is already provided");
@@ -203,14 +183,14 @@ impl Compiler {
     fn get_optional_compiled_attr_value(
         &mut self,
         name: &StrView,
-        mut src: XmlText,
+        mut src: Text,
         dst: &mut Option<StrView>,
     ) -> Result {
         ensure!(dst.is_none(), "`{name}` attribute is already provided");
 
         self.compile_text_node(&mut src)?;
         self.error_ctx_frag = Some(name.clone());
-        *dst = src.parts.into_iter().next().map(XmlTextFragment::into_text);
+        *dst = src.parts.into_iter().next().map(TextLexeme::into_text);
         Ok(())
     }
 
@@ -232,7 +212,7 @@ impl Compiler {
         Ok(self.templates[template_id].clone())
     }
 
-    fn forbid_children_in_element(&mut self, element: &XmlElement) -> Result {
+    fn forbid_children_in_element(&mut self, element: &Element) -> Result {
         if !element.body.is_empty() {
             self.error_ctx_frag = Some(element.name.clone());
             bail!("`{}` element cannot have children", element.name)
@@ -240,7 +220,7 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_template_element(&mut self, element: &mut XmlElement) -> Result {
+    fn compile_template_element(&mut self, element: &mut Element) -> Result {
         self.error_ctx_frag = Some(take(&mut element.name));
         if !self.is_top_level {
             bail!("`<$template>` is only allowed at the top level");
@@ -291,8 +271,8 @@ impl Compiler {
         Ok(())
     }
 
-    // TODO: consider expanding `<$children />` to an ad-hoc template to not reduce copying
-    fn expand_template(&mut self, element: &mut XmlElement) -> Result {
+    // TODO: consider expanding `<$children />` to an ad-hoc template to reduce copying
+    fn expand_template(&mut self, element: &mut Element) -> Result {
         self.error_ctx_frag = Some(element.name.clone());
         let name = take(&mut element.name).after(1);
         let template = self.get_template(&name)?;
@@ -334,7 +314,7 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_foreach_element(&mut self, element: &mut XmlElement) -> Result {
+    fn compile_foreach_element(&mut self, element: &mut Element) -> Result {
         let mut attrs_iter = take(&mut element.attrs).into_iter();
         self.error_ctx_frag = Some(take(&mut element.name));
 
@@ -421,7 +401,7 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_children_element(&mut self, element: &mut XmlElement) -> Result {
+    fn compile_children_element(&mut self, element: &mut Element) -> Result {
         self.forbid_children_in_element(element)?;
 
         self.error_ctx_frag = Some(take(&mut element.name));
@@ -436,7 +416,7 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_raw_element(&mut self, element: &mut XmlElement) -> Result {
+    fn compile_raw_element(&mut self, element: &mut Element) -> Result {
         if !element.attrs.is_empty() {
             let mut attrs = take(&mut element.attrs).into_vec();
             let new_element_name_attr = attrs.remove(0);
@@ -457,70 +437,44 @@ impl Compiler {
             self.compile_node(node)?;
             write!(escaped_body, "{node:#}")?;
         }
-        element.body =
-            [XmlNode::Text(XmlText { parts: [XmlTextFragment::Text(escaped_body.into())].into() })]
-                .into();
+        element.body = [StrView::from(escaped_body).into()].into();
 
         Ok(())
     }
 
-    fn compile_register_template_ext_element(&mut self, element: &mut XmlElement) -> Result {
+    fn compile_register_asset_ext_element(&mut self, element: &mut Element) -> Result {
         self.forbid_children_in_element(element)?;
 
-        let mut attrs = take(&mut element.attrs).into_vec();
-        if attrs.is_empty() {
-            let e = anyhow!("no file extension provided to `<{}>`", element.name);
-            self.error_ctx_frag = Some(take(&mut element.name));
-            return Err(e);
-        }
-        let ext_attr = attrs.remove(0);
-        self.get_flag_value(&ext_attr)?;
-        if let Some(extra) = attrs.into_iter().next() {
-            self.error_ctx_frag = Some(extra.name);
-            bail!("`<{}>` only accepts 1 attribute", element.name);
-        }
+        self.error_ctx_frag = Some(take(&mut element.name));
+        ensure!(
+            !element.attrs.is_empty(),
+            "`<{}>` must have at least 1 attribute",
+            self.error_ctx_frag.display()
+        );
 
-        self.asset_manager.register_template_ext(ext_attr.name.into_os_str_view());
+        for decl in take(&mut element.attrs) {
+            let mut category_name_buf = None;
+            let category = self
+                .get_required_compiled_attr_value(&decl.name, decl.value, &mut category_name_buf)?
+                .parse::<AssetCategory>()?;
+            self.asset_manager.register_asset_ext(decl.name.into_os_str_view(), category);
+        }
 
         element.name = "".into();
         Ok(())
     }
 
-    fn compile_ref_like_element(&mut self, element: &mut XmlElement) -> Result {
-        let is_ref_element = element.name == "$ref";
-
-        let ref_element_name = if is_ref_element {
-            self.forbid_children_in_element(element)?;
-            take(&mut element.name)
-        } else {
-            element.name.clone()
-        };
-        let mut last_processing_mode_marker = None;
+    fn compile_ref_element(&mut self, element: &mut Element, ref_attr_name: &str) -> Result {
+        let element_name = element.name.clone();
+        let mut last_asset_category_marker = None;
         let mut last_cached_marker = None;
-        let expected_var_name = is_ref_element.not().then(|| match &*element.name {
-            "a" | "image" | "use" | "link" => "href",
-            "img" | "script" => "src",
-            "form" => "action",
-            _ => unreachable!("compile_ref_like_element called on element `{}`", element.name),
-        });
         let mut var_name = None;
         let mut path = None;
+        let mut ref_attr_name_span = None;
 
         let mut recovered_attrs = Vec::new();
         for attr in take(&mut element.attrs) {
             match &*attr.name {
-                "$raw" | "$template" => {
-                    if let Some(ref marker) = last_processing_mode_marker {
-                        let e =
-                            anyhow!("Redundant `{}`, `{}` was already provided", attr.name, marker);
-                        self.error_ctx_frag = Some(attr.name);
-                        return Err(e);
-                    }
-
-                    self.get_flag_value(&attr)?;
-                    last_processing_mode_marker = Some(attr.name);
-                }
-
                 "$cached" => {
                     if let Some(ref marker) = last_cached_marker {
                         self.error_ctx_frag = Some(attr.name);
@@ -531,29 +485,37 @@ impl Compiler {
                     last_cached_marker = Some(attr.name);
                 }
 
-                // Ref attrs
-                _ if !is_ref_element && Some(&*attr.name) == expected_var_name => {
+                "$var" => {
                     self.error_ctx_frag = Some(attr.name.clone());
                     self.get_required_compiled_attr_value(
                         &attr.name,
                         attr.value.clone(),
-                        &mut path,
+                        &mut var_name,
                     )?;
-                    var_name = Some(attr.name.clone());
-                    recovered_attrs.push(attr);
                 }
 
-                _ if is_ref_element && attr.name.starts_with('$') => {
-                    self.error_ctx_frag = Some(attr.name.clone());
-                    self.get_required_compiled_attr_value(&attr.name, attr.value, &mut path)?;
-                    var_name = Some(attr.name.after(1));
-                }
-
-                unknown => {
-                    if is_ref_element {
-                        let e = anyhow!("Unexpected attribute: {unknown}");
+                _ if let Ok(asset_category_marker) = attr.name.clone().strip_prefix('$') => {
+                    if let Some(ref prev_marker) = last_asset_category_marker {
+                        let e = anyhow!(
+                            "Redundant `${asset_category_marker}`, `{prev_marker}` was already provided"
+                        );
                         self.error_ctx_frag = Some(attr.name);
                         return Err(e);
+                    }
+
+                    self.get_flag_value(&attr)?;
+                    last_asset_category_marker = Some(attr.name);
+                }
+
+                _ => {
+                    if &*attr.name == ref_attr_name {
+                        ref_attr_name_span = Some(attr.name.clone());
+                        self.error_ctx_frag.clone_from(&ref_attr_name_span);
+                        self.get_required_compiled_attr_value(
+                            &attr.name,
+                            attr.value.clone(),
+                            &mut path,
+                        )?;
                     }
                     recovered_attrs.push(attr);
                 }
@@ -561,45 +523,45 @@ impl Compiler {
         }
         element.attrs = recovered_attrs.into();
 
-        let (Some(var_name), Some(path)) = (var_name, path) else {
-            self.error_ctx_frag = Some(ref_element_name);
+        let (Some(path), Some(ref_attr_name_span)) = (path, ref_attr_name_span) else {
+            self.error_ctx_frag = Some(element_name);
 
             bail!(
                 "The asset to reference is not provided. \
-                   Add an attribute in the form of `{}=\"path/to/file\"`",
-                expected_var_name.unwrap_or("$VARNAME"),
+                   Add an attribute in the form of `{ref_attr_name}=\"path/to/file\"`",
             );
         };
+        self.error_ctx_frag = Some(ref_attr_name_span);
 
         let not_cached = last_cached_marker.is_none();
         if not_cached && url_scheme(&path).is_some() {
             return Ok(());
         }
-        let is_template = last_processing_mode_marker.map(|marker| marker == "$template");
+        let asset_category = last_asset_category_marker
+            .as_deref()
+            .try_map(str::parse)
+            .inspect_err(|_| self.error_ctx_frag = last_asset_category_marker)?;
 
-        let asset = self.asset_manager.add_asset(path.clone(), not_cached, is_template)?;
+        let normalised: StrView = rel_link_to_file_path(&path).into_owned().into();
+        let asset = self.asset_manager.add_asset(normalised.clone(), not_cached, asset_category)?;
 
-        let path_with_fragment = match path.split_once('#') {
-            Some((_, fragment)) => format!("{}#{}", asset.path, fragment).into(),
-            None => asset.path.clone(),
-        };
-
-        if is_ref_element {
-            // `<$ref>`
-            self.lua_ctx.set_var(&var_name, &path_with_fragment)?;
-        } else if !not_cached {
-            let Some(ref_attr) = element.attr_mut(&var_name) else {
-                bail!("bug: ref attr `{var_name}` disappeared from `<{}>`", element.name);
+        if !not_cached {
+            let Some(ref_attr) = element.attr_mut(ref_attr_name) else {
+                bail!("bug: ref attr `{ref_attr_name}` disappeared from `<{}>`", element.name);
             };
-            ref_attr.value = path_with_fragment.into();
+            ref_attr.value = asset.path.clone().into();
+        }
+
+        if let Some(var_name) = var_name {
+            self.lua_ctx.set_var(&var_name, &normalised)?;
         }
 
         Ok(())
     }
 
-    fn compile_element(&mut self, element: &mut XmlElement) -> Result {
-        if let "!DOCTYPE" | "area" | "base" | "br" | "col" | "embed" | "hr" | "input" | "meta"
-        | "param" | "source" | "track" | "wbr" = &*element.name
+    fn compile_element(&mut self, element: &mut Element) -> Result {
+        if let "!DOCTYPE" | "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input"
+        | "link" | "meta" | "param" | "source" | "track" | "wbr" = &*element.name
         {
             self.forbid_children_in_element(element)?;
         }
@@ -609,10 +571,11 @@ impl Compiler {
             "$foreach" => self.compile_foreach_element(element)?,
             "$children" => self.compile_children_element(element)?,
             "$raw" => self.compile_raw_element(element)?,
-            "$registerTemplateExt" => self.compile_register_template_ext_element(element)?,
-            "$ref" | "a" | "image" | "use" | "link" | "img" | "script" | "form" => {
-                self.compile_ref_like_element(element)?;
-            }
+            "$registerAssetExt" => self.compile_register_asset_ext_element(element)?,
+            "a" | "image" | "use" | "link" => self.compile_ref_element(element, "href")?,
+            "img" | "script" => self.compile_ref_element(element, "src")?,
+            "form" => self.compile_ref_element(element, "action")?,
+
             template if template.starts_with('$') => self.expand_template(element)?,
 
             _ => {}
@@ -629,10 +592,10 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_node(&mut self, node: &mut XmlNode) -> Result {
+    fn compile_node(&mut self, node: &mut Node) -> Result {
         match node {
-            XmlNode::Element(element) => self.compile_element(element),
-            XmlNode::Text(text) => self.compile_text_node(text),
+            Node::Element(element) => self.compile_element(element),
+            Node::Text(text) => self.compile_text_node(text),
         }
     }
 
@@ -651,25 +614,61 @@ impl Compiler {
         )
     }
 
-    fn rectify_html_tree(element: &mut XmlElement) {
+    fn rectify_html_tree(element: &mut Element) {
         let mut new_body = Vec::with_capacity(element.body.len());
         for child in take(&mut element.body) {
             match child {
-                XmlNode::Element(mut child_element) => {
+                Node::Element(mut child_element) => {
                     Self::rectify_html_tree(&mut child_element);
                     if child_element.name.is_empty() {
                         new_body.extend(child_element.body);
                     } else {
-                        new_body.push(XmlNode::Element(child_element));
+                        new_body.push(Node::Element(child_element));
                     }
                 }
-                text @ XmlNode::Text(_) => new_body.push(text),
+                text @ Node::Text(_) => new_body.push(text),
             }
         }
         element.body = new_body.into();
     }
 
-    fn postprocess_html_doc(root: &mut XmlElement) {
+    fn compile_markdown(&mut self, node: &mut Node) -> Result {
+        match node {
+            Node::Element(element) => {
+                for child in &mut element.body {
+                    self.compile_markdown(child)?;
+                }
+            }
+            Node::Text(text) => {
+                let Some(first_part) = text.parts.first() else {
+                    return Ok(());
+                };
+
+                let mut lines = (**first_part.as_text()).lines();
+                let Some(mut without_indentation) = lines.next().map(str::to_owned) else {
+                    return Ok(());
+                };
+                let expected_indent_len = text.indent_level * Self::SPACES_PER_INDENT;
+                for line in lines {
+                    let indent_len = line.bytes().take_while(|&b| b == b' ').count();
+                    without_indentation.push('\n');
+                    without_indentation.push_str(&line[min(indent_len, expected_indent_len)..]);
+                }
+
+                let nodes = MarkdownParser::new(&without_indentation).collect::<Vec<_>>();
+                *node = nodes.into();
+                self.compile_node(node)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn postprocess_html_doc(&mut self, root: &mut Element) -> Result {
+        for child in &mut root.body {
+            self.compile_markdown(child)?;
+        }
+
         Self::rectify_html_tree(root);
 
         let mut extra_children_in_root = Vec::with_capacity(root.body.len());
@@ -677,30 +676,30 @@ impl Compiler {
         let mut existing_doctype_element = None;
         for child in take(&mut root.body) {
             match &child {
-                XmlNode::Element(x) if x.name == "!DOCTYPE" => {
+                Node::Element(x) if x.name == "!DOCTYPE" => {
                     existing_doctype_element = Some(child);
                 }
-                XmlNode::Element(x) if x.name == "html" => existing_html_element = Some(child),
+                Node::Element(x) if x.name == "html" => existing_html_element = Some(child),
                 _ => extra_children_in_root.push(child),
             }
         }
 
         let doctype_element = existing_doctype_element.unwrap_or_else(|| {
-            XmlNode::Element(XmlElement {
+            Node::Element(Element {
                 name: "!DOCTYPE".into(),
                 attrs: [("html", None).into()].into(),
                 body: default(),
             })
         });
         let html_element = existing_html_element.unwrap_or_else(|| {
-            XmlNode::Element(XmlElement {
+            Node::Element(Element {
                 name: "html".into(),
                 attrs: default(),
                 body: extra_children_in_root.into(),
             })
         });
         root.body = [doctype_element, html_element].into();
-        let Some(XmlNode::Element(html_element)) = root.body.last_mut() else {
+        let Some(Node::Element(html_element)) = root.body.last_mut() else {
             unreachable!("did not create an `<html>` element")
         };
 
@@ -710,9 +709,9 @@ impl Compiler {
         let mut existing_head_element = None;
         for child in take(&mut html_element.body) {
             match child {
-                XmlNode::Element(x) if x.name == "head" => existing_head_element = Some(x),
-                XmlNode::Element(x) if x.name == "body" => existing_body_element = Some(x),
-                XmlNode::Element(ref x)
+                Node::Element(x) if x.name == "head" => existing_head_element = Some(x),
+                Node::Element(x) if x.name == "body" => existing_body_element = Some(x),
+                Node::Element(ref x)
                     if let "title" | "base" | "link" | "style" | "meta" | "script" | "noscript"
                     | "template" = &*x.name =>
                 {
@@ -728,7 +727,7 @@ impl Compiler {
                 existing
             }
 
-            None => XmlElement {
+            None => Element {
                 name: "head".into(),
                 attrs: default(),
                 body: head_elements_in_html.into(),
@@ -737,7 +736,7 @@ impl Compiler {
 
         if head_element.subelements("meta").all(|meta| meta.attr("charset").is_none()) {
             head_element.body = chain(
-                [XmlNode::Element(XmlElement {
+                [Node::Element(Element {
                     name: "meta".into(),
                     attrs: [("charset", Some("UTF-8")).into()].into(),
                     body: default(),
@@ -747,34 +746,56 @@ impl Compiler {
             .collect();
         }
 
-        let body_element = existing_body_element.unwrap_or_else(|| XmlElement {
+        let body_element = existing_body_element.unwrap_or_else(|| Element {
             name: "body".into(),
             attrs: default(),
             body: take(&mut extra_children_in_html).into(),
         });
         html_element.body =
-            chain(extra_children_in_html, [head_element, body_element].map(XmlNode::Element))
+            chain(extra_children_in_html, [head_element, body_element].map(Node::Element))
                 .collect();
+
+        Ok(())
     }
 
-    pub fn compile(&mut self) -> Result {
+    fn parse_template(src: StrView, asset: Asset) -> Result<Node> {
+        let result = Cell::new(Ok(()));
+        let node = Node::Text(Text {
+            indent_level: 0,
+            parts: TextLexer::new(src, asset, &result).collect(),
+        });
+        result.into_inner().map(|_| node)
+    }
+
+    fn parse_document(src: StrView, asset: &Asset) -> Result<Node> {
+        let result = Cell::new(Ok(()));
+        let root = Node::Element(Element {
+            name: ROOT_ELEMEMT.into(),
+            attrs: default(),
+            body: HtmlParser::new(src, asset, &result).collect(),
+        });
+        result.into_inner().map(|_| root)
+    }
+
+    fn compile(&mut self) -> Result {
         while let Some((src, asset)) = self.asset_manager.next_uncompiled_asset() {
-            let mut ast_builder = AstBuilder::new(src, &asset);
-            let mut root = XmlElement {
-                name: ROOT_ELEMEMT.into(),
-                attrs: default(),
-                body: ast_builder.by_ref().collect(),
+            let category = asset.category;
+            let mut node = match category {
+                AssetCategory::Raw => continue,
+                AssetCategory::Template => Self::parse_template(src, asset)?,
+                AssetCategory::HtmlDocument | AssetCategory::Document => Self::parse_document(src, &asset)?,
             };
 
-            ast_builder.finish()?;
-            self.compile_element(&mut root).map_err(|e| self.wrap_compilation_error(e))?;
-            root.name = "".into();
+            self.compile_node(&mut node).map_err(|e| self.wrap_compilation_error(e))?;
 
-            if &*asset.ext == "html" {
-                Self::postprocess_html_doc(&mut root);
+            if let Node::Element(root) = &mut node {
+                root.name = "".into();
+                if category == AssetCategory::HtmlDocument {
+                    self.postprocess_html_doc(root).map_err(|e| self.wrap_compilation_error(e))?;
+                }
             }
 
-            self.asset_manager.save_compilation_result(XmlNode::Element(root));
+            self.asset_manager.save_compilation_result(node);
         }
         Ok(())
     }

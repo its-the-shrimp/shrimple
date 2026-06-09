@@ -1,6 +1,9 @@
+#![allow(dead_code)]
+
 use {
     shrimple_parser::{Input, pattern::Pattern, tuple::first},
     std::{
+        borrow::Borrow,
         cmp::Ordering,
         ffi::{OsStr, OsString},
         fmt::{Debug, Display, Formatter},
@@ -117,6 +120,11 @@ impl<T: ?Sized + AsRef<U>, U: ?Sized> AsRef<U> for View<'_, T> {
         self.deref().as_ref()
     }
 }
+impl<T: ?Sized> Borrow<T> for View<'_, T> {
+    fn borrow(&self) -> &T {
+        self
+    }
+}
 
 impl<T: ?Sized> Deref for View<'_, T> {
     type Target = T;
@@ -194,19 +202,6 @@ impl Input for View<'_, str> {
     }
 }
 
-impl<'borrow, T: ?Sized> View<'borrow, T> {
-    fn unpack(self) -> Result<&'borrow T, Arc<T>> {
-        // Safety: see the struct definition for the invariants of the fields
-        unsafe {
-            if self.off == usize::MAX {
-                Ok(self.ptr.as_ref())
-            } else {
-                Err(Arc::from_raw(self.ptr.byte_sub(self.off).as_ptr()))
-            }
-        }
-    }
-}
-
 impl<'borrow> View<'borrow, str> {
     /// Unlike the `From<&'borrow str>` impl, this functions puts no lifetimes contraints, and
     /// clones the string slice instead.
@@ -281,12 +276,4 @@ impl<'borrow> View<'borrow, str> {
 
         Iter { rest: self }
     }
-}
-
-#[test]
-fn shared_str_split_at() {
-    assert_eq!(
-        StrView::from(Arc::from("abcdef")).split_at(3),
-        (View::from("abc"), View::from("def"))
-    );
 }

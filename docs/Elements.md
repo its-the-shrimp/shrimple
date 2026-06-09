@@ -73,47 +73,47 @@ Will expand to the following:
 &lt;b&gt;And this is just text&lt;/b&gt;
 ```
 
+The element name can be a shrimple element like a template or something built-in, in which case
+the resulting element will be evaluated again, with its just children as one blob of escaped HTML:
+```html
+<$template name=greet acceptsChildren>
+    Hi, <$children />
+</>
+
+<$raw $greet><br /></>
+```
+will become
+```html
+Hi, &lt;br /&gt;
+```
+
 ### Parameters:
 - `name attrs... (?)`: replace `$raw` with `name` as the element name and keep `attrs...` in it.
 
 **Children:** required
 
-## `<$ref>`
+## `<$registerAssetExt>`
 
 ```html
-<$ref processed $JS="index.js" />
+<$registerAssetExt js=template css=raw />
 ```
 
-Manually register an asset & assign the path to it (unchanged) to a Lua variable.
+Associate file extensions to [asset categories](docs/Assets.md#asset-categories)
 
-Keep in mind that if the asset is mentioned in an HTML element's attribute, this is unnecessary.
-
-**Parameters:**
-- `$VAR_NAME=path (1)`: Register `path` as an asset and assign `path` to the variable `VAR_NAME`. `path` must resolve to the path to a local file.
-- `$raw (?)`: Enforce that the asset is _not_ processed as a template file. Mutually exclusive with `$template`.
-- `$template (?)`: Enforce that the asset is processed as a template file. Mutually exclusive with `$raw`.
-
-If neither `$raw` nor `$template` are specified,
-processing mode of the asset is the determined by its file extension.
-See the [Assets](docs/Assets.md) section for more information on this. <br />
-
-**Children:** forbidden
-
-## `<$registerTemplateExt>`
-
-```html
-<$registerTemplateExt js />
-```
-
-Registers a file extension, the files with which will be processed as template files.
-
-The example above declares that from then on, `.js` files are to be treated as template assets.
+The example above declares that from then on, `.js` files are to be treated as template assets,
+and `css` files as raw assets.
 
 When registering a new template file extension, make sure the syntax of corresponding files doesn't
 overlap with the syntax of shrimple templates, namely, pay attention to the way `$` is treated
 
 ### Parameters:
-- `ext (1)`: `ext` will be the new processed file extension. It must not contain the initial dot.
+- `ext=category (+)`: `ext` will indicate an asset of `category`.
+    `ext` must not contain the initial dot.
+    Permitted values of `category`:
+    - `raw`
+    - `template`
+    - `document`
+    - `htmldocument`
 
 **Children:** forbidden
 
@@ -127,7 +127,13 @@ overlap with the syntax of shrimple templates, namely, pay attention to the way 
 </>
 ```
 
-Define a new template.
+Define a new template. The template will be usable as an element with the name prefixed by `$`, and
+the arguments will have to be provided without the `$`.
+```html
+<$BODY title="Shrimple Docs">
+    <h1>Hello, World</>
+</>
+```
 
 ### Parameters:
 - `name=name (1)`: `name` is the name of the template.

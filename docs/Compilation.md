@@ -13,15 +13,16 @@ All references to local assets are considered to be relative to the root.
 2. Lexemes are gathered into a Concrete Syntax Tree (CST)
 3. The CST is processed downward & inward, evaluating Lua code, variable access,
 template declarations, expansions, etc. in that order.
-4. If the asset is HTML, it goes through post-processing steps, where the following transformations
+4. If the asset is an HTML document, it goes through post-processing steps, where the following transformations
 are applied:
-    - `<!DOCTYPE html>` gets added to the top of the document, if absent originally;
-    - The document is wrapped in `<html>`, if not wrapped originally;
-    - A `<body>` & a `<head>` are added to `<html>`, if absent originally;
-    - All direct children of `<html>` that are [head elements] get wrapped in `<head>`,
+    1. All Markdown in text nodes is compiled to HTML.
+    1. `<!DOCTYPE html>` gets added to the top of the document, if absent originally;
+    2. The document is wrapped in `<html>`, if not wrapped originally;
+    3. A `<body>` & a `<head>` are added to `<html>`, if absent originally;
+    4. All direct children of `<html>` that are [head elements] get wrapped in `<head>`,
         the rest get wrapped in `<body>`, if it was absent originally;
-    - `<meta charset="UTF-8" />` is inserted into `<head>`, if absent originally.
-5. Steps 1-4 get applied to all the other template assets after the root. If an asset declares
+    5. `<meta charset="UTF-8" />` is inserted into `<head>`, if absent originally.
+5. Steps 1-4 get applied to all the other HTML documents after the root. If an asset declares
 a new template asset, that asset gets into a queue that is advanced only when the current asset
 is fully compiled, i.e. the compilation sequence is flat & sequential.
 6. After all the assets are discovered & all template assets are compiled, the results are written

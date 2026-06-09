@@ -19,17 +19,29 @@ impl<S: AsRef<str>> Display for EscapeHtml<S> {
             return f.write_str(self.0.as_ref());
         }
 
-        for byte in self.0.as_ref().bytes() {
-            match byte {
-                b'&' => f.write_str("&amp;")?,
-                b'<' => f.write_str("&lt;")?,
-                b'>' => f.write_str("&gt;")?,
-                // Safety: we're writing them all anyway, not breaking any UTF-8 sequences.
-                _ => unsafe {
-                    f.write_char(char::from_u32_unchecked(byte.into()))?;
-                },
-            }
+        for chunk in self.0.as_ref().split_inclusive(['&', '<', '>']) {
+            let mut chars = chunk.chars();
+            let (normal, escaped) = match chars.next_back() {
+                Some('&') => (chars.as_str(), "&amp;"),
+                Some('<') => (chars.as_str(), "&lt;"),
+                Some('>') => (chars.as_str(), "&gt;"),
+                _ => (chunk, ""),
+            };
+            f.write_str(normal)?;
+            f.write_str(escaped)?;
         }
+
         Ok(())
     }
+}
+
+#[test]
+fn no_unicode_distortion() {
+    let example = "из Łódź в 大阪";
+
+    assert_eq!(
+        example,
+        &format!("{:#}", EscapeHtml(example)),
+        "`EscapeHtml` distorted Unicode"
+    );
 }

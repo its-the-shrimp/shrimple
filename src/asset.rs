@@ -1,17 +1,16 @@
 use {
     crate::{
-        ast::XmlNode,
         mime::{self, path_extension},
-        utils::{BoolExt, InlineStr, Result, assume_static_mut, default},
+        utils::{BoolExt, InlineStr, Result, assume_static_mut, copy, default},
         view::{OsStrView, StrView},
     },
-    anyhow::{Context, bail},
+    anyhow::{Context, Error, bail},
     futures_util::TryFutureExt,
     reqwest::{Client as AsyncClient, blocking::Client as SyncClient},
     shrimple_parser::utils::{Location, locate_in_multiple},
     std::{
-        ffi::OsStr, fmt::Display, fs::read_to_string, mem::replace, panic::resume_unwind,
-        path::Path,
+        collections::HashMap, ffi::OsStr, fmt::Display, fs::read_to_string, mem::replace,
+        panic::resume_unwind, path::Path, str::FromStr,
     },
     tokio::{
         fs::{File, create_dir_all, hard_link, remove_file, write},
@@ -31,19 +30,48 @@ pub enum AssetState {
     Compiled { src: StrView, res: StrView },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetCategory {
+    Raw,
+    Template,
+    Document,
+    HtmlDocument,
+}
+
+impl FromStr for AssetCategory {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(match s {
+            "raw" => Self::Raw,
+            "template" => Self::Template,
+            "document" => Self::Document,
+            "htmldocument" => Self::HtmlDocument,
+            _unknown => bail!("unknown asset category `{s}`"),
+        })
+    }
+}
+
+impl AssetCategory {
+    /// Some asset categories may force a certain file extension
+    pub const fn ext(self) -> Option<&'static str> {
+        match self {
+            Self::HtmlDocument => Some("html"),
+            _ => None,
+        }
+    }
+}
+
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub struct Asset {
     pub path: StrView,
     pub ext: InlineStr,
     pub url: Option<StrView>,
     pub state: AssetState,
+    pub category: AssetCategory,
 }
 
 impl Asset {
-    pub fn is_template(path: impl AsRef<Path>, template_exts: &[impl AsRef<OsStr>]) -> bool {
-        path.as_ref().extension().is_some_and(|ext| template_exts.iter().any(|x| x.as_ref() == ext))
-    }
-
     pub const fn template_src(&self) -> Option<&StrView> {
         match &self.state {
             AssetState::Template { src } => Some(src),
@@ -62,11 +90,9 @@ impl Asset {
         self.url.as_ref().unwrap_or(&self.path)
     }
 
-    pub fn set_compilation_result(&mut self, res: impl Display) {
+    pub fn set_compilation_result(&mut self, res: StrView) {
         self.state = match replace(&mut self.state, AssetState::Raw) {
-            AssetState::Template { src } => {
-                AssetState::Compiled { src, res: res.to_string().into() }
-            }
+            AssetState::Template { src } => AssetState::Compiled { src, res },
             other => other,
         };
     }
@@ -74,7 +100,7 @@ impl Asset {
 
 pub struct AssetManager {
     assets: Vec<Asset>,
-    template_exts: Vec<OsStrView>,
+    ext2category: HashMap<OsStrView, AssetCategory>,
     http_client: SyncClient,
 }
 
@@ -82,7 +108,12 @@ impl Default for AssetManager {
     fn default() -> Self {
         Self {
             assets: default(),
-            template_exts: vec!["html".into(), "css".into(), "svg".into()],
+            ext2category: HashMap::from([
+                ("html".into(), AssetCategory::HtmlDocument),
+                ("md".into(), AssetCategory::HtmlDocument),
+                ("svg".into(), AssetCategory::Document),
+                ("css".into(), AssetCategory::Template),
+            ]),
             http_client: default(),
         }
     }
@@ -93,6 +124,14 @@ impl AssetManager {
         self.assets.iter()
     }
 
+    pub fn asset_category_by_ext(&self, ext: impl AsRef<OsStr>) -> AssetCategory {
+        self.ext2category.get(ext.as_ref()).map_or(AssetCategory::Raw, copy)
+    }
+
+    pub fn asset_category(&self, path: impl AsRef<Path>) -> Option<AssetCategory> {
+        path.as_ref().extension().map(|ext| self.asset_category_by_ext(ext))
+    }
+
     pub fn locate(&self, ptr: *const u8) -> Option<(StrView, Location)> {
         locate_in_multiple(
             ptr,
@@ -100,8 +139,8 @@ impl AssetManager {
         )
     }
 
-    pub fn register_template_ext(&mut self, ext: OsStrView) {
-        self.template_exts.push(ext);
+    pub fn register_asset_ext(&mut self, ext: OsStrView, category: AssetCategory) {
+        self.ext2category.insert(ext, category);
     }
 
     /// The function will return the same value until `set_compilation_result` is called
@@ -111,9 +150,9 @@ impl AssetManager {
             .find_map(|asset| asset.template_src().map(|src| (src.clone(), asset.clone())))
     }
 
-    pub fn save_compilation_result(&mut self, res: XmlNode) {
+    pub fn save_compilation_result(&mut self, res: impl Display) {
         if let Some(asset) = self.assets.iter_mut().find(|asset| asset.template_src().is_some()) {
-            asset.set_compilation_result(res);
+            asset.set_compilation_result(format!("{res:#}").into());
         }
     }
 
@@ -149,13 +188,8 @@ impl AssetManager {
         &mut self,
         path_or_url: StrView,
         is_local: bool,
-        is_template: Option<bool>,
+        category: Option<AssetCategory>,
     ) -> Result<&mut Asset> {
-        let mut path_or_url = path_or_url.trim_start_matches('/');
-        if let Some(fragment_start) = path_or_url.find('#') {
-            path_or_url.truncate(fragment_start);
-        }
-
         if let Some(res) = self.assets.iter_mut().find(|asset| asset.path_or_url() == &path_or_url)
         {
             // SAFETY: the fn signature assets correctness, just circumventing borrow checker
@@ -163,11 +197,14 @@ impl AssetManager {
             return Ok(unsafe { assume_static_mut(res) });
         }
 
-        let is_template =
-            is_template.unwrap_or_else(|| Asset::is_template(&path_or_url, &self.template_exts));
+        let category = category.or_else(|| self.asset_category(&path_or_url));
         let ext;
         let src;
-        (src, ext) = self.get_asset_metadata(&path_or_url, is_local, is_template)?;
+        (src, ext) = self.get_asset_metadata(
+            &path_or_url,
+            is_local,
+            category.is_some_and(|c| c != AssetCategory::Raw),
+        )?;
         let state = src.map_or(AssetState::Raw, |src| AssetState::Template { src });
         let mut path = path_or_url;
         let mut url = None;
@@ -177,7 +214,13 @@ impl AssetManager {
             path = format!("cached/{n_remote_assets}.{ext}").into();
         }
 
-        Ok(self.assets.push_mut(Asset { path, ext, url, state }))
+        Ok(self.assets.push_mut(Asset {
+            category: category.unwrap_or_else(|| self.asset_category_by_ext(&*ext)),
+            path,
+            ext,
+            url,
+            state,
+        }))
     }
 
     pub async fn write_to_disk(&mut self, dst_root: impl AsRef<Path>) -> Result {
@@ -186,7 +229,10 @@ impl AssetManager {
 
         let mut tasks = JoinSet::<Result>::new();
         for asset in self.assets.drain(..) {
-            let dst = dst_root.join(&asset.path);
+            let mut dst = dst_root.join(&asset.path);
+            if let Some(dst_ext) = asset.category.ext() {
+                dst.set_extension(dst_ext);
+            }
 
             match &asset.state {
                 AssetState::Raw => {
@@ -218,9 +264,13 @@ impl AssetManager {
                                     .await
                                     .with_context(|| format!("failed to create {dst_dir:?}"))?;
                             }
-                            remove_file(&dst).await.with_context(|| {
-                                format!("failed to remove {dst:?} to link it to {src:?}")
-                            })?;
+
+                            if dst.exists() {
+                                remove_file(&dst).await.with_context(|| {
+                                    format!("failed to remove {dst:?} to link it to {src:?}")
+                                })?;
+                            }
+
                             hard_link(&src, &dst)
                                 .await
                                 .with_context(|| format!("failed to link {src:?} to {dst:?}"))
@@ -243,7 +293,6 @@ impl AssetManager {
                         write(&dst, &res)
                             .await
                             .with_context(|| format!("failed to write to {dst:?}"))?;
-                        eprintln!("Wrote {} bytes to {dst:?}", res.len());
                         Ok(())
                     });
                 }

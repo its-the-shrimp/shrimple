@@ -39,9 +39,5 @@ impl<S: AsRef<str>> Display for EscapeHtml<S> {
 fn no_unicode_distortion() {
     let example = "из Łódź в 大阪";
 
-    assert_eq!(
-        example,
-        &format!("{:#}", EscapeHtml(example)),
-        "`EscapeHtml` distorted Unicode"
-    );
+    assert_eq!(example, &format!("{:#}", EscapeHtml(example)), "`EscapeHtml` distorted Unicode");
 }

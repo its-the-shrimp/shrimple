@@ -41,6 +41,8 @@ Expands to the children provided to the currently expanded template, thus forbid
 
 Iterates a directory and expands to its children for every encountered file.
 
+Files are sorted by name in ascending order.
+
 On every iteration sets the variable `index` to the number of the current iteration, starting from 0
 
 ### Parameters (exactly in the specified order):

@@ -94,6 +94,18 @@ impl<T> OptionExt<T> for Option<T> {
     }
 }
 
+pub trait ResultExt<T> {
+    fn merge(self) -> T;
+}
+
+impl<T> ResultExt<T> for Result<T, T> {
+    fn merge(self) -> T {
+        match self {
+            Ok(x) | Err(x) => x,
+        }
+    }
+}
+
 pub unsafe fn assume_static<T>(x: &T) -> &'static T {
     // SAFETY: up to the caller
     unsafe { transmute(x) }

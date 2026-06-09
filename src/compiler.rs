@@ -4,7 +4,7 @@ use {
         error::{Expansions, ExtraCtx, collect_template_expansion_info},
         lexer::{TextLexeme, TextLexer, url_scheme},
         parser::{Attr, Element, HtmlParser, MarkdownParser, Node, Text},
-        utils::{InlineStr, OptionExt, Result, default, rel_link_to_file_path},
+        utils::{InlineStr, OptionExt, Result, ResultExt, default, rel_link_to_file_path},
         view::StrView,
     },
     anyhow::{Context, anyhow, bail, ensure},
@@ -369,9 +369,9 @@ impl Compiler {
             return Err(e);
         }
 
-        let loop_template = take(&mut element.body);
-        let mut expanded_body = Vec::new();
-        for (i, entry_or_err) in read_dir(&dir)?.enumerate() {
+        // TODO: customisable order
+        let mut file_paths = Vec::new();
+        for entry_or_err in read_dir(&dir)? {
             let entry = entry_or_err.inspect_err(|_| {
                 self.error_ctx_frag = Some(dir_attr.name.clone());
             })?;
@@ -382,10 +382,18 @@ impl Compiler {
                         "directory `{dir}` contains a file with a non-UTF8 name: {:?}",
                         entry.path()
                     )
-                })?;
+                })?
+                .into_boxed_str();
 
+            let new_file_path_id = file_paths.binary_search(&path).merge();
+            file_paths.insert(new_file_path_id, path);
+        }
+
+        let loop_template = take(&mut element.body);
+        let mut expanded_body = Vec::new();
+        for (i, path) in file_paths.iter().enumerate() {
             self.error_ctx_frag = Some(iter_var_name.clone());
-            self.lua_ctx.set_var(&iter_var_name, &path)?;
+            self.lua_ctx.set_var(&iter_var_name, path)?;
             let mut i_str = InlineStr::<15>::default();
             write!(i_str, "{i}")?;
             self.lua_ctx.set_var("index", &i_str)?;
@@ -783,7 +791,9 @@ impl Compiler {
             let mut node = match category {
                 AssetCategory::Raw => continue,
                 AssetCategory::Template => Self::parse_template(src, asset)?,
-                AssetCategory::HtmlDocument | AssetCategory::Document => Self::parse_document(src, &asset)?,
+                AssetCategory::HtmlDocument | AssetCategory::Document => {
+                    Self::parse_document(src, &asset)?
+                }
             };
 
             self.compile_node(&mut node).map_err(|e| self.wrap_compilation_error(e))?;

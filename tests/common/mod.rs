@@ -88,7 +88,10 @@ fn compare_dirs_inner(a: &Path, b: &Path, rel: &Path, diffs: &mut String) -> io:
                     if a_content != b_content {
                         let a_content = String::from_utf8_lossy(&a_content);
                         let b_content = String::from_utf8_lossy(&b_content);
-                        _ = writeln!(diffs, "files differ: {a_path:?} & {b_path:?}\n\n{a_content:?}\n\n{b_content:?}");
+                        _ = writeln!(
+                            diffs,
+                            "files differ: {a_path:?} & {b_path:?}\n\n{a_content:?}\n\n{b_content:?}"
+                        );
                     }
                 }
             }

@@ -7,7 +7,7 @@ use {
     anyhow::{Context, Error, bail},
     futures_util::TryFutureExt,
     reqwest::{Client as AsyncClient, blocking::Client as SyncClient},
-    shrimple_parser::utils::{Location, locate_in_multiple},
+    shrimple_parser::Location,
     std::{
         collections::HashMap, ffi::OsStr, fmt::Display, fs::read_to_string, mem::replace,
         panic::resume_unwind, path::Path, str::FromStr,
@@ -133,7 +133,7 @@ impl AssetManager {
     }
 
     pub fn locate(&self, ptr: *const u8) -> Option<(StrView, Location)> {
-        locate_in_multiple(
+        Location::find_in_multiple(
             ptr,
             self.assets.iter().map(|a| (a.path.clone(), a.src().unwrap_or_default())),
         )

@@ -9,10 +9,7 @@ use {
     },
     anyhow::{Context, anyhow, bail, ensure},
     mlua::{FromLua, Lua, Value},
-    shrimple_parser::{
-        Input,
-        utils::{FullLocation, PathLike},
-    },
+    shrimple_parser::Input,
     std::{
         cell::Cell,
         cmp::min,
@@ -615,11 +612,9 @@ impl Compiler {
             return e;
         };
 
-        e.context(ExtraCtx(FullLocation { path: path.to_string().into_path_bytes(), loc })).context(
-            Expansions(
-                self.template_expansions.iter().map(|x| x.template_name_in_invoc.clone()).collect(),
-            ),
-        )
+        e.context(ExtraCtx(loc.with_path(path.to_string()))).context(Expansions(
+            self.template_expansions.iter().map(|x| x.template_name_in_invoc.clone()).collect(),
+        ))
     }
 
     fn rectify_html_tree(element: &mut Element) {

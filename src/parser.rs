@@ -11,7 +11,7 @@ use {
     },
     anyhow::anyhow,
     pulldown_cmark::{Event, HeadingLevel, Options, Tag},
-    shrimple_parser::utils::{FullLocation, PathLike, locate},
+    shrimple_parser::Location,
     std::{
         cell::Cell,
         fmt::{self, Display, Formatter},
@@ -61,7 +61,7 @@ impl Display for Element {
             match &*self.name {
                 "!DOCTYPE" | "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input"
                 | "link" | "meta" | "param" | "source" | "track" | "wbr" => {
-                    return write!(f, "/>");
+                    return write!(f, " />");
                 }
                 _ => (),
             }
@@ -385,13 +385,10 @@ impl Iterator for HtmlParser<'_> {
                     let Some(src) = self.asset.template_src() else {
                         break 'e Err(e);
                     };
-                    let Some(loc) = locate(lexeme.as_src_ptr(), src) else {
+                    let Some(loc) = Location::find(lexeme.as_src_ptr(), src) else {
                         break 'e Err(e);
                     };
-                    Err(e.context(ExtraCtx(FullLocation {
-                        path: self.asset.path.to_string().into_path_bytes(),
-                        loc,
-                    })))
+                    Err(e.context(ExtraCtx(loc.with_path(self.asset.path.to_string()))))
                 });
             })
             .ok()
@@ -400,8 +397,7 @@ impl Iterator for HtmlParser<'_> {
 
 impl<'a> HtmlParser<'a> {
     pub fn new(src: StrView, asset: &'a Asset, result: &'a Cell<Result>) -> Self {
-        let lexer = Lexer::new(src, asset.clone(), result);
-        Self { iter: lexer.peekable(), asset, result }
+        Self { iter: Lexer::new(src, asset.clone(), result).peekable(), asset, result }
     }
 }
 

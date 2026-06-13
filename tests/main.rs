@@ -17,3 +17,8 @@ fn table() {
 fn unicode() {
     run_test("tests/samples/unicode");
 }
+
+#[test]
+fn unquoted_attr_value_with_slash() {
+    run_test("tests/samples/unquoted_attr_value_with_slash");
+}

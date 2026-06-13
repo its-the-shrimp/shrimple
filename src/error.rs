@@ -1,9 +1,6 @@
 use {
     crate::{asset::Asset, lexer::Expected, view::StrView},
-    shrimple_parser::{
-        FullParsingError,
-        utils::{FullLocation, PathLike, WithSourceLine, locate_in_multiple},
-    },
+    shrimple_parser::{FullLocation, FullParsingError, Location},
     std::{
         backtrace::BacktraceStatus,
         fmt::{Debug, Display, Formatter, Write},
@@ -55,19 +52,19 @@ pub fn collect_template_expansion_info<'asset>(
     };
 
     if let Some(loc) = loc {
-        _ = write!(&mut msg, "\n--> {}", WithSourceLine(loc));
+        _ = write!(&mut msg, "\n{}", loc.with_source_line());
     }
 
     let assets = assets.into_iter();
     let expansions = error.downcast_ref::<Expansions>().map(|x| &x.0);
     for name in expansions.iter().flat_map(|x| x.iter().rev()) {
         _ = write!(&mut msg, "\n\n...while expanding template `<${name}>`");
-        if let Some((path, loc)) = locate_in_multiple(
+        if let Some((path, loc)) = Location::find_in_multiple(
             name.as_ptr(),
             assets.clone().filter_map(|asset| Some((&asset.path, asset.src()?))),
         ) {
-            let loc = FullLocation { loc, path: path.into_path_bytes() };
-            _ = write!(&mut msg, "\n--> {}", WithSourceLine(&loc));
+            let loc = loc.with_path(&**path);
+            _ = write!(&mut msg, "\n{}", loc.with_source_line());
         }
     }
 

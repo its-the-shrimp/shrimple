@@ -1,16 +1,11 @@
 use {
-    crate::{
-        asset::Asset,
-        error::ExtraCtx,
-        escape_html::EscapeHtml,
-        utils::{Result, is_in},
-        view::StrView,
-    },
+    crate::{asset::Asset, error::ExtraCtx, escape_html::EscapeHtml, utils::Result, view::StrView},
     shrimple_parser::{
-        Input, Parser as _, ParsingError, any, from_tuple,
-        pattern::{parse, parse_group, parse_until, parse_until_ex, parse_while},
-        tuple::first,
-        utils::{FullLocation, PathLike, locate},
+        Input, Location, Parser as _, ParsingError, Pattern, any, from_tuple,
+        parser::{group, many, one, until, until_ex},
+        pattern::whitespace,
+        seq,
+        tuple::{first, second},
     },
     std::{
         cell::Cell,
@@ -48,22 +43,21 @@ impl Display for Attr {
 impl Attr {
     fn lex_attr_value(input: StrView) -> ParsingResult<TextLexeme> {
         any! {
-            lex_template_expr.map(TextLexeme::Expr),
-            lex_template_var.map(TextLexeme::Var),
-            lex_string_literal.map(TextLexeme::Text),
-            lex_word.map(TextLexeme::Text),
+            lex_template_expr.map_out(TextLexeme::Expr),
+            lex_template_var.map_out(TextLexeme::Var),
+            lex_string_literal.map_out(TextLexeme::Text),
+            lex_word.filter_fatal(Expected::AttrValue, |x| !x.is_empty()).map_out(TextLexeme::Text),
         }
         .parse(input)
     }
 
     fn lex(input: StrView) -> ParsingResult<Self> {
-        lex_whitespace
-            .map(|s| s.len())
-            .skip(parse_while(is_ident_char).filter(|s: &StrView| !s.is_empty()))
-            .expect(Expected::AttrName)
-            .get_span()
-            .add(parse('=').map_reason(|x| match x {}).then(Self::lex_attr_value).maybe())
-            .map(from_tuple!(Attr { name_start, prefix_and_name, value }))
+        lex_whitespace::<Expected>
+            .map_out(|s| s.len())
+            .skip(many(is_ident_char).filter(|s: &StrView| !s.is_empty()))
+            .and_span()
+            .add(one('=').then(Self::lex_attr_value).maybe())
+            .map_out(from_tuple!(Attr { name_start, prefix_and_name, value }))
             .parse(input)
     }
 
@@ -87,14 +81,8 @@ impl Display for OpeningTagEnd {
 }
 
 impl OpeningTagEnd {
-    /// Any returned error is recoverable.
-    fn lex(input: StrView) -> ParsingResult<Self, Infallible> {
-        lex_whitespace
-            .skip(parse('/'))
-            .and(parse('>'))
-            .get_span()
-            .map(|(.., span)| Self(span))
-            .parse(input)
+    fn lex<Reason>(input: StrView) -> ParsingResult<Self, Reason> {
+        one(seq!(whitespace.many(), '/'.maybe(), whitespace.many(), '>')).map_out(Self).parse(input)
     }
 
     pub fn as_src_ptr(&self) -> *const u8 {
@@ -137,9 +125,9 @@ impl Display for TextLexeme {
 impl TextLexeme {
     fn lex(input: StrView) -> ParsingResult<Self> {
         any! {
-            lex_template_expr.map(TextLexeme::Expr),
-            lex_template_var.map(TextLexeme::Var),
-            parse_until('$').map(TextLexeme::Text).map_reason(|x| match x {}),
+            lex_template_expr.map_out(TextLexeme::Expr),
+            lex_template_var.map_out(TextLexeme::Var),
+            until('$').map_out(TextLexeme::Text),
             else: TextLexeme::Text
         }
         .parse(input)
@@ -201,27 +189,37 @@ impl Display for Lexeme {
 }
 
 impl Lexeme {
+    const fn plain_text(text: StrView) -> Self {
+        Self::Text(TextLexeme::Text(text))
+    }
+
+    const fn var(name: StrView) -> Self {
+        Self::Text(TextLexeme::Var(name))
+    }
+
+    const fn expr(code: StrView) -> Self {
+        Self::Text(TextLexeme::Expr(code))
+    }
+
     fn lex(input: StrView) -> ParsingResult<Self> {
         lex_comment
             .repeat()
             .then(any! {
-                lex_code_span.map(TextLexeme::Text).map(Self::Text),
-                lex_closing_tag.map(Lexeme::ClosingTag),
-                lex_opening_tag_start.map(Lexeme::OpeningTagStart),
-                lex_template_expr.map(TextLexeme::Expr).map(Self::Text),
-                lex_template_var.map(TextLexeme::Var).map(Self::Text),
-                parse_until(is_in(['$', '<', '`'])).map(TextLexeme::Text).map(Self::Text)
-                    .map_reason(|x| match x {}),
-                else: |x| Self::Text(TextLexeme::Text(x))
+                lex_code_span.map_out(Self::plain_text),
+                lex_closing_tag.map_out(Self::ClosingTag),
+                lex_opening_tag_start.map_out(Self::OpeningTagStart),
+                lex_template_expr.map_out(Self::expr),
+                lex_template_var.map_out(Self::var),
+                until(['$', '<', '`']).map_out(Self::plain_text),
+                else: Self::plain_text
             })
             .parse(input)
     }
 
     fn lex_in_opening_tag(input: StrView) -> ParsingResult<Self> {
-        OpeningTagEnd::lex
-            .map_reason(|x| match x {})
-            .map(Self::OpeningTagEnd)
-            .or(Attr::lex.map(Lexeme::Attr))
+        OpeningTagEnd::lex::<Expected>
+            .map_out(Self::OpeningTagEnd)
+            .or(Attr::lex.map_out(Self::Attr))
             .parse(input)
     }
 
@@ -239,11 +237,10 @@ impl Lexeme {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expected {
     ClosedTag,
-    Word,
     StrLiteral,
     TemplateExpr,
     TemplateVarName,
-    AttrName,
+    AttrValue,
     Comment,
 }
 
@@ -251,11 +248,13 @@ impl Display for Expected {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::ClosedTag => write!(f, "expected `/>` or `>`"),
-            Self::Word => write!(f, "expected a word terminated by whitespace, `/>` or `>`"),
             Self::StrLiteral => write!(f, "expected a string terminated by `\"`"),
             Self::TemplateExpr => write!(f, "expected an expression terminated by `)`"),
             Self::TemplateVarName => write!(f, "expected a variable name"),
-            Self::AttrName => write!(f, "expected an attribute name"),
+            Self::AttrValue => write!(
+                f,
+                "expected a Lua variable, a Lua code block, a string enclosed in double quotes, or a word terminated by whitespace or `>`"
+            ),
             Self::Comment => write!(f, "expected a comment terminated by `-->`"),
         }
     }
@@ -275,84 +274,67 @@ fn wrap_parsing_error(e: &ParsingError<impl Input, Expected>, asset: &Asset) -> 
         None => anyhow::Error::msg("bug: parsing error without reason"),
     };
 
-    let Some(loc) = asset.template_src().and_then(|src| locate(e.rest.as_ptr(), src)) else {
+    let Some(loc) = asset.template_src().and_then(|src| Location::find(e.rest.as_ptr(), src))
+    else {
         return res;
     };
 
-    res.context(ExtraCtx(FullLocation { path: asset.path.to_string().into_path_bytes(), loc }))
+    res.context(ExtraCtx(loc.with_path(asset.path.to_string())))
 }
 
 type ParsingResult<T = (), E = Expected> = shrimple_parser::ParsingResult<StrView, T, E>;
 
-#[expect(clippy::trivially_copy_pass_by_ref, reason = "easier to pass through parsers")]
-fn is_ident_char(ch: &char) -> bool {
-    ch.is_alphanumeric() || ":_-$".contains(*ch)
+fn is_ident_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ":_-$".contains(ch)
 }
 
-fn lex_word(input: StrView) -> ParsingResult<StrView> {
-    parse_until(is_in([' ', '\n', '\t', '/', '>'])).expect(Expected::Word)(input)
+fn lex_word<Reason>(input: StrView) -> ParsingResult<StrView, Reason> {
+    until((whitespace, '>'))(input)
 }
 
-fn lex_whitespace(input: StrView) -> ParsingResult<StrView, Infallible> {
-    parse_while(char::is_ascii_whitespace)(input)
+fn lex_whitespace<Reason>(input: StrView) -> ParsingResult<StrView, Reason> {
+    many(whitespace)(input)
 }
 
 /// Recoverable if no initial double quote found
 fn lex_string_literal(input: StrView) -> ParsingResult<StrView> {
-    parse('"')
-        .map_reason(|x| match x {})
-        .then(parse_until_ex('"').expect(Expected::StrLiteral))
-        .parse(input)
+    one('"').then(until_ex('"').or_reason(Expected::StrLiteral)).parse(input)
 }
 
 /// Recoverable if no initial "$(" found
 fn lex_template_expr(input: StrView) -> ParsingResult<StrView> {
-    parse('$')
-        .map_reason(|x| match x {})
-        .then(parse_group('(', ')').map_reason(|_| Expected::TemplateExpr))
-        .parse(input)
+    one('$').then(group('(', ')').map_reason(|_| Expected::TemplateExpr)).parse(input)
 }
 
 fn lex_template_var(input: StrView) -> ParsingResult<StrView> {
-    parse('$')
-        .map_reason(|x| match x {})
+    one('$')
         .then(
-            parse_while(is_ident_char)
-                .filter(|s: &StrView| !s.is_empty())
-                .expect(Expected::TemplateVarName),
+            many(is_ident_char)
+                .filter_fatal(Expected::TemplateVarName, |s: &StrView| !s.is_empty()),
         )
         .parse(input)
 }
 
 fn lex_code_span(input: StrView) -> ParsingResult<StrView> {
-    parse('`')
-        .skip(parse_until_ex('`'))
-        .get_span()
-        .map(|(_, span)| span)
-        .map_reason(|x| match x {})
-        .parse(input)
+    one('`').skip(until_ex('`')).and_span().map_out(second).parse(input)
 }
 
 /// The output is the element name, without the `<`.
 /// Recoverable if no initial `<` is found.
 fn lex_opening_tag_start(input: StrView) -> ParsingResult<StrView> {
-    parse('<').map_reason(|x| match x {}).then(lex_word)(input)
+    one('<').then(lex_word)(input)
 }
 
 /// Recoverable if no initial `<!--` is found.
 fn lex_comment(input: StrView) -> ParsingResult<StrView> {
-    parse("<!--")
-        .map_reason(|x| match x {})
-        .then(parse_until_ex("-->").expect(Expected::Comment))
-        .parse(input)
+    one("<!--").then(until_ex("-->").or_reason(Expected::Comment)).parse(input)
 }
 
 fn lex_closing_tag(input: StrView) -> ParsingResult<StrView> {
-    parse("</")
-        .map_reason(|x| match x {})
+    one("</")
         .then(lex_word)
-        .skip(lex_whitespace.map_reason(|x| match x {}))
-        .skip(parse('>').expect(Expected::ClosedTag))
+        .skip(lex_whitespace)
+        .skip(one('>').or_reason(Expected::ClosedTag))
         .parse(input)
 }
 

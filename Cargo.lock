@@ -1326,9 +1326,9 @@ checksum = "4d746c05a454358a607af8b2a8f0322c99841c2fc4e7ac5f227abe6393c34e90"
 
 [[package]]
 name = "shrimple-parser"
-version = "0.0.13"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8260ce0f60d18e85b915d2b425a4eb52ee5d2f5d8a958b124cfa971a0d0d1463"
+checksum = "d92f98de107e4344a9ee7e3e7153d17fdc7c74fda175c465d3e28c2159175842"
 
 [[package]]
 name = "simd-adler32"

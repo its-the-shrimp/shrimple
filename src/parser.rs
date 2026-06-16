@@ -3,13 +3,13 @@
 use {
     crate::{
         asset::Asset,
+        bail, ensure,
         error::ExtraCtx,
         escape_html::EscapeHtml,
         lexer::{Lexeme, Lexer, TextLexeme, TextLexer},
         utils::{Result, default},
         view::StrView,
     },
-    anyhow::anyhow,
     pulldown_cmark::{Event, HeadingLevel, Options, Tag},
     shrimple_parser::Location,
     std::{
@@ -91,10 +91,8 @@ impl Element {
 
         let opening_tag_end = loop {
             match iter.next() {
-                None => {
-                    return Err(anyhow!("unclosed opening tag")
-                        .context(ExtraCtx(Lexeme::OpeningTagStart(name))));
-                }
+                None => bail!(span: name, "unclosed opening tag"),
+
                 Some(Lexeme::Attr(attr)) => {
                     let (name, value) = attr.into_parts();
                     attrs.push(Attr {
@@ -117,8 +115,10 @@ impl Element {
                         },
                     });
                 }
+
                 Some(Lexeme::OpeningTagEnd(opening_tag_end)) => break opening_tag_end,
-                frag => return Err(anyhow!("unexpected input").context(ExtraCtx(frag))),
+
+                Some(other) => bail!(span: other.into_text(), "unexpected input"),
             }
         };
 
@@ -128,15 +128,19 @@ impl Element {
                     Lexeme::ClosingTag(closing_name) => Ok(closing_name),
                     frag => Err(frag),
                 }) {
-                    if !closing_name.is_empty() && closing_name != name {
-                        return Err(anyhow!("expected `</{name}>` or `</>`")
-                            .context(ExtraCtx(Lexeme::ClosingTag(closing_name))));
-                    }
+                    ensure!(
+                        span: closing_name,
+                        closing_name.is_empty() || closing_name == name,
+                        "expected `</{name}>` or `</>`",
+                    );
                     break;
-                } else if iter.peek().is_none() {
-                    return Err(anyhow!("unclosed element")
-                        .context(ExtraCtx(Lexeme::OpeningTagStart(name))));
                 }
+
+                ensure!(
+                    span: name,
+                    iter.peek().is_some(),
+                    "unclosed element",
+                );
 
                 children.push(Node::parse(iter, indent_level + 1, asset)?);
             }
@@ -379,13 +383,13 @@ impl Iterator for HtmlParser<'_> {
         Node::parse(&mut self.iter, 0, self.asset)
             .map_err(|e| {
                 self.result.set('e: {
-                    let Some(ExtraCtx(lexeme)) = e.downcast_ref::<ExtraCtx<Lexeme>>() else {
+                    let Some(span) = e.downcast_ref::<ExtraCtx<StrView>>() else {
                         break 'e Err(e);
                     };
-                    let Some(src) = self.asset.template_src() else {
+                    let Some(src) = self.asset.src() else {
                         break 'e Err(e);
                     };
-                    let Some(loc) = Location::find(lexeme.as_src_ptr(), src) else {
+                    let Some(loc) = Location::find(span.0.as_ptr(), &src) else {
                         break 'e Err(e);
                     };
                     Err(e.context(ExtraCtx(loc.with_path(self.asset.path.to_string()))))

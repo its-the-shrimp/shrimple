@@ -1,13 +1,17 @@
 use {
     crate::{
         asset::{Asset, AssetCategory, AssetManager},
-        error::{Expansions, ExtraCtx, collect_template_expansion_info},
+        bail, ensure,
+        error::{AnyhowResultExt, Expansions, ExtraCtx, collect_template_expansion_info},
         lexer::{TextLexeme, TextLexer, url_scheme},
         parser::{Attr, Element, HtmlParser, MarkdownParser, Node, Text},
-        utils::{InlineStr, OptionExt, Result, ResultExt, default, rel_link_to_file_path},
+        utils::{
+            HomogenousResultExt, InlineStr, OptionExt, Result, ResultExt, default,
+            rel_link_to_file_path,
+        },
         view::StrView,
     },
-    anyhow::{Context, anyhow, bail, ensure},
+    anyhow::Context,
     mlua::{FromLua, Lua, Value},
     shrimple_parser::Input,
     std::{
@@ -18,7 +22,6 @@ use {
         iter::chain,
         mem::{replace, take},
         path::Path,
-        sync::Arc,
     },
 };
 
@@ -37,44 +40,56 @@ impl Default for LuaCtx {
 }
 
 impl LuaCtx {
-    fn with_var<R>(&self, name: &str, f: impl FnOnce(&str) -> R) -> mlua::Result<R> {
-        let str = self.inner.globals().raw_get::<&str, Option<mlua::String>>(name)?;
-        Ok(match str {
-            Some(s) => f(s.to_str()?),
-            None => f(""),
-        })
+    fn with_var<R>(&self, name: &StrView, f: impl FnOnce(&str) -> R) -> Result<R> {
+        let res = (|| -> Result<R> {
+            let str = self.inner.globals().raw_get::<&str, Option<mlua::String>>(name)?;
+            Ok(match str {
+                Some(s) => f(s.to_str()?),
+                None => f(""),
+            })
+        })();
+        res.with_span(name)
     }
 
-    fn set_var(&self, name: &str, value: &str) -> mlua::Result<()> {
-        self.inner.globals().set(name, value)
+    fn set_var(&self, name: &StrView, value: &str) -> Result {
+        self.inner.globals().set(&**name, value).adapt_err().with_span(name)
     }
 
-    fn with_eval_result<R>(&self, code: &str, f: impl FnOnce(&str) -> R) -> mlua::Result<R> {
-        Ok(match self.inner.load(code).set_name("").eval()? {
-            Value::Nil => f(""),
+    fn with_eval_result<R>(&self, code: &StrView, f: impl FnOnce(&str) -> R) -> Result<R> {
+        let res = (|| -> Result<R> {
+            Ok(match self.inner.load(&**code).set_name("").eval()? {
+                Value::Nil => f(""),
 
-            Value::String(s) => f(s.to_str()?),
+                Value::String(s) => f(s.to_str()?),
 
-            Value::Integer(i) => {
-                let mut str = InlineStr::<64>::default();
-                _ = write!(str, "{i}");
-                f(&str)
-            }
+                Value::Integer(i) => {
+                    let mut str = InlineStr::<64>::default();
+                    _ = write!(str, "{i}");
+                    f(&str)
+                }
 
-            Value::Number(n) => {
-                let mut str = InlineStr::<64>::default();
-                _ = write!(str, "{n}");
-                f(&str)
-            }
+                Value::Number(n) => {
+                    let mut str = InlineStr::<64>::default();
+                    _ = write!(str, "{n}");
+                    f(&str)
+                }
 
-            other => f(&String::from_lua(other, &self.inner)?),
-        })
+                other => f(&String::from_lua(other, &self.inner)?),
+            })
+        })();
+        res.with_span(code)
     }
 }
 
 struct Param {
     name: StrView,
     default: Option<StrView>,
+}
+
+impl Param {
+    const fn is_required(&self) -> bool {
+        self.default.is_none()
+    }
 }
 
 struct Template {
@@ -86,9 +101,9 @@ struct Template {
 }
 
 impl Template {
-    fn get_param(&self, name: &str) -> Result<&Param> {
+    fn get_param(&self, name: &StrView) -> Result<&Param> {
         let Ok(param_id) = self.params.binary_search_by_key(&name, |param| &param.name) else {
-            bail!("template `{}` has no parameter named `{}`", self.name, name);
+            bail!(span: name.clone(), "template `{}` has no parameter named `{}`", self.name, name);
         };
         Ok(&self.params[param_id])
     }
@@ -99,15 +114,42 @@ struct TemplateExpansion {
     body: Box<[Node]>,
 }
 
+#[derive(Default)]
+struct Templates(Vec<Template>);
+
+impl Templates {
+    fn add(&mut self, template: Template) -> Result {
+        let Err(i) = self.0.binary_search_by_key(&&template.name, |t| &t.name) else {
+            bail!(span: template.name, "template `{}` is already defined", template.name);
+        };
+        self.0.insert(i, template);
+        Ok(())
+    }
+
+    fn get(&self, name: &StrView) -> Result<&Template> {
+        let Ok(template_id) = self.0.binary_search_by_key(&name, |t| &t.name) else {
+            bail!(span: name.clone(), "template `{name}` is not defined");
+        };
+        Ok(&self.0[template_id])
+    }
+}
+
 struct Compiler {
     is_top_level: bool,
     asset_manager: AssetManager,
     lua_ctx: LuaCtx,
-    // wrapped in Arc to prevent borrow checking errors
-    templates: Vec<Arc<Template>>,
+    templates: Templates,
     template_expansions: Vec<TemplateExpansion>,
-    /// The piece of source code the compiler was processing when the error occured
-    error_ctx_frag: Option<StrView>,
+}
+
+fn forbid_children_in_element(element: &Element) -> Result {
+    ensure!(
+        span: element.name.clone(),
+        element.body.is_empty(),
+        "`{}` element cannot have children",
+        element.name,
+    );
+    Ok(())
 }
 
 impl Compiler {
@@ -121,19 +163,24 @@ impl Compiler {
             lua_ctx: default(),
             templates: default(),
             template_expansions: default(),
-            error_ctx_frag: default(),
         }
     }
 
-    fn compile_text_lexeme(&mut self, fragment: &TextLexeme, dst: &mut String) -> Result<()> {
+    fn compile_text_lexeme(&self, fragment: &TextLexeme, dst: &mut String) -> Result<()> {
         match fragment {
             TextLexeme::Var(name) => {
-                self.error_ctx_frag = Some(name.clone());
-                self.lua_ctx.with_var(name, |v| dst.write_str(v))??;
+                self.lua_ctx
+                    .with_var(name, |v| dst.write_str(v))
+                    .adapt_err()
+                    .flatten()
+                    .with_span(name)?;
             }
             TextLexeme::Expr(code) => {
-                self.error_ctx_frag = Some(code.clone());
-                self.lua_ctx.with_eval_result(code, |res| dst.write_str(res))??;
+                self.lua_ctx
+                    .with_eval_result(code, |res| dst.write_str(res))
+                    .adapt_err()
+                    .flatten()
+                    .with_span(code)?;
             }
             TextLexeme::Text(text) => dst.write_str(text)?,
         }
@@ -141,52 +188,47 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_text_node(&mut self, node: &mut Text) -> Result {
+    fn compile_text_node(&self, node: &mut Text) -> Result {
         if node.parts.is_empty() {
             return Ok(());
         }
 
         let mut res = String::new();
         for part in take(&mut node.parts) {
-            self.compile_text_lexeme(&part, &mut res).inspect_err(|_| {
-                self.error_ctx_frag = Some(part.into_text());
-            })?;
+            self.compile_text_lexeme(&part, &mut res)?;
         }
         node.parts = [TextLexeme::Text(res.into())].into();
         Ok(())
     }
 
     fn get_required_compiled_attr_value<'dst>(
-        &mut self,
+        &self,
         name: &StrView,
         mut src: Text,
         dst: &'dst mut Option<StrView>,
     ) -> Result<&'dst mut StrView> {
-        ensure!(dst.is_none(), "`{name}` attribute is already provided");
+        ensure!(span: name.clone(), dst.is_none(), "`{name}` attribute is already provided");
 
         self.compile_text_node(&mut src)?;
         Ok(dst.insert(
             src.parts
                 .into_iter()
                 .next()
-                .with_context(|| {
-                    self.error_ctx_frag = Some(name.clone());
-                    format!("`{name}` attribute must have a value")
-                })?
+                .with_context(|| format!("`{name}` attribute must have a value"))
+                .with_span(name)?
                 .into_text(),
         ))
     }
 
     fn get_optional_compiled_attr_value(
-        &mut self,
+        &self,
         name: &StrView,
         mut src: Text,
         dst: &mut Option<StrView>,
     ) -> Result {
-        ensure!(dst.is_none(), "`{name}` attribute is already provided");
+        ensure!(span: name.clone(), dst.is_none(), "`{name}` attribute is already provided");
 
         self.compile_text_node(&mut src)?;
-        self.error_ctx_frag = Some(name.clone());
         *dst = src.parts.into_iter().next().map(TextLexeme::into_text);
         Ok(())
     }
@@ -194,88 +236,87 @@ impl Compiler {
     // TODO: come up with a way to control the value of boolean flags via Lua.
     // Which string values do we treat as `true`? which as `false`? should any other values cause
     // an error?
-    fn get_flag_value(&mut self, attr: &Attr) -> Result<bool> {
-        self.error_ctx_frag = Some(attr.name.clone());
+    #[expect(clippy::unused_self, reason = "later this fn will eval lua")]
+    fn get_flag_value(&self, attr: &Attr, name_span: &mut Option<StrView>) -> Result<bool> {
+        if let Some(existing) = name_span {
+            if &attr.name == existing {
+                bail!(span: attr.name.clone(), "`{existing}` attribute is already provided");
+            }
+            bail!(span: attr.name.clone(), "Unnecessary `{}`, `{existing}` alreay provided", attr.name);
+        }
+        *name_span = Some(attr.name.clone());
+
         match &*attr.value.parts {
             [] => Ok(true),
-            _ => bail!("`{}` attribute is just a flag and must not have a value", attr.name),
+            _ => bail!(
+                span: attr.name.clone(),
+                "`{}` attribute must not have a value",
+                attr.name,
+            ),
         }
-    }
-
-    fn get_template(&self, name: &str) -> Result<Arc<Template>> {
-        let Ok(template_id) = self.templates.binary_search_by_key(&name, |t| &t.name) else {
-            bail!("template `{name}` is not defined");
-        };
-        Ok(self.templates[template_id].clone())
-    }
-
-    fn forbid_children_in_element(&mut self, element: &Element) -> Result {
-        if !element.body.is_empty() {
-            self.error_ctx_frag = Some(element.name.clone());
-            bail!("`{}` element cannot have children", element.name)
-        }
-        Ok(())
     }
 
     fn compile_template_element(&mut self, element: &mut Element) -> Result {
-        self.error_ctx_frag = Some(take(&mut element.name));
-        if !self.is_top_level {
-            bail!("`<$template>` is only allowed at the top level");
-        }
+        let element_name = take(&mut element.name);
+        ensure!(
+            span: element_name,
+            self.is_top_level,
+            "`<{}>` is only allowed at the top level",
+            element.name,
+        );
 
         let mut name = None;
         let mut accepts_children = false;
+        let mut accepts_children_name_span = None;
         let mut params = vec![];
 
         for attr in take(&mut element.attrs) {
-            self.error_ctx_frag = Some(attr.name.clone());
             match &*attr.name {
                 "name" => {
                     self.get_required_compiled_attr_value(&attr.name, attr.value, &mut name)?;
-                    if name.as_deref().is_none_or(str::is_empty) {
-                        bail!("template name must be provided");
-                    }
+                    ensure!(
+                        span: attr.name,
+                        !name.as_deref().is_none_or(str::is_empty),
+                        "template name cannot be empty",
+                    );
                 }
-                "acceptsChildren" => accepts_children = self.get_flag_value(&attr)?,
+                "acceptsChildren" => {
+                    accepts_children =
+                        self.get_flag_value(&attr, &mut accepts_children_name_span)?;
+                }
                 param if param.starts_with('$') => {
                     let mut default = None;
                     self.get_optional_compiled_attr_value(&attr.name, attr.value, &mut default)?;
                     let name = attr.name.after(1);
                     params.push(Param { name, default });
                 }
-                unknown => bail!("`$template` has no attribute named `{unknown}`"),
+                unknown => bail!(
+                    span: attr.name,
+                    "`$template` has no attribute named `{unknown}`",
+                ),
             }
         }
 
         let Some(name) = name else {
-            bail!("template name must be provided");
+            bail!(span: take(&mut element.name), "template name must be provided");
         };
 
-        let Err(new_template_id) = self.templates.binary_search_by_key(&&name, |t| &t.name) else {
-            let err = anyhow!("template `{name}` is already defined");
-            self.error_ctx_frag = Some(name);
-            return Err(err);
-        };
-        self.templates.insert(
-            new_template_id,
-            Arc::new(Template {
-                name,
-                accepts_children,
-                params: params.into(),
-                body: take(&mut element.body),
-            }),
-        );
+        self.templates.add(Template {
+            name,
+            accepts_children,
+            params: params.into(),
+            body: take(&mut element.body),
+        })?;
         Ok(())
     }
 
     // TODO: consider expanding `<$children />` to an ad-hoc template to reduce copying
     fn expand_template(&mut self, element: &mut Element) -> Result {
-        self.error_ctx_frag = Some(element.name.clone());
         let name = take(&mut element.name).after(1);
-        let template = self.get_template(&name)?;
+        let template = self.templates.get(&name)?;
 
         if !template.accepts_children {
-            self.forbid_children_in_element(element)?;
+            forbid_children_in_element(element)?;
         }
         self.template_expansions.push(TemplateExpansion {
             body: replace(&mut element.body, template.body.clone()),
@@ -287,15 +328,13 @@ impl Compiler {
                 continue;
             }
 
-            self.error_ctx_frag = Some(param.name.clone());
             let Some(default) = param.default.as_ref() else {
-                bail!("no value provided for parameter `{}`", param.name);
+                bail!(span: param.name.clone(), "no value provided for parameter `{}`", param.name);
             };
             self.lua_ctx.set_var(&param.name, default)?;
         }
 
         for arg in take(&mut element.attrs) {
-            self.error_ctx_frag = Some(arg.name.clone());
             template.get_param(&arg.name)?;
 
             let mut value = None;
@@ -313,71 +352,76 @@ impl Compiler {
 
     fn compile_foreach_element(&mut self, element: &mut Element) -> Result {
         let mut attrs_iter = take(&mut element.attrs).into_iter();
-        self.error_ctx_frag = Some(take(&mut element.name));
 
         let Some(iter_var_name_attr) = attrs_iter.next() else {
-            bail!("expected the iterator variable declaration, got nothing");
+            bail!(
+                span: take(&mut element.name),
+                "expected the iterator variable declaration, got nothing",
+            );
         };
         if !iter_var_name_attr.name.starts_with('$') {
-            self.error_ctx_frag = Some(iter_var_name_attr.name);
             bail!(
-                "expected the iterator variable declaration. \
-                           Prefix the variable name with `$`"
+                span: iter_var_name_attr.name,
+                "expected the iterator variable declaration. Prefix the variable name with `$`",
             );
         }
         if let Some(value_part) = iter_var_name_attr.value.parts.first() {
-            self.error_ctx_frag = Some(value_part.as_text().clone());
             bail!(
+                span: value_part.as_text().clone(),
                 "the iterator variable cannot have a pre-defined value. \
-                            Remove `=` and the value after it"
+                 Remove `=` and the value after it",
             );
         }
         let iter_var_name = iter_var_name_attr.name.after(1);
 
         let Some(in_kw) = attrs_iter.next() else {
-            let iter_var_name_len = iter_var_name.len();
-            self.error_ctx_frag = Some(iter_var_name.after(iter_var_name_len));
-            bail!("expected `in`, got nothing");
+            bail!(span: iter_var_name.end(), "expected `in`, got nothing");
         };
-        if in_kw.name != "in" {
-            let e = anyhow!("expected `in`, got `{}`", in_kw.name);
-            self.error_ctx_frag = Some(in_kw.name);
-            return Err(e);
-        }
+
+        ensure!(
+            span: in_kw.name,
+            in_kw.name == "in",
+            "expected `in`, got `{}`",
+            in_kw.name,
+        );
+        self.get_flag_value(&in_kw, &mut None)?;
+
         if let Some(value_part) = in_kw.value.parts.first() {
-            self.error_ctx_frag = Some(value_part.as_text().clone());
-            bail!("extraneous text starting from `=`. Remove it");
+            bail!(
+                span: value_part.as_text().clone(),
+                "extraneous text starting from `=`. Remove it",
+            );
         }
 
         let Some(dir_attr) = attrs_iter.next() else {
-            let in_kw_len = in_kw.name.len();
-            self.error_ctx_frag = Some(in_kw.name.after(in_kw_len));
-            bail!("expected the `dir` iterator, found nothing");
+            bail!(span: in_kw.name.end(), "expected the `dir` iterator, found nothing");
         };
-        self.error_ctx_frag = Some(dir_attr.name.clone());
-        ensure!(dir_attr.name == "dir", "expected `dir`, got `{}`", dir_attr.name);
+        ensure!(span: dir_attr.name, dir_attr.name == "dir", "expected `dir`, got `{}`", dir_attr.name);
         let mut dir = None;
         let dir =
             self.get_required_compiled_attr_value(&dir_attr.name, dir_attr.value, &mut dir)?;
 
         if let Some(extra_attr) = attrs_iter.next() {
-            let e = anyhow!("extraneous attribute `{}`. Remove it", extra_attr.name);
-            self.error_ctx_frag = Some(extra_attr.name);
-            return Err(e);
+            bail!(
+                span: extra_attr.name.start(),
+                "extraneous attributes. Remove them",
+            );
         }
 
         // TODO: customisable order
         let mut file_paths = Vec::new();
-        for entry_or_err in read_dir(&dir)? {
-            let entry = entry_or_err.inspect_err(|_| {
-                self.error_ctx_frag = Some(dir_attr.name.clone());
-            })?;
+        for entry_or_err in read_dir(&dir)
+            .with_context(|| format!("failed to start reading the directory `{dir}`"))
+            .with_span(&dir_attr.name)?
+        {
+            let entry = entry_or_err
+                .with_context(|| format!("failed to fetch an entry in the directory `{dir}`"))
+                .with_span(&dir_attr.name)?;
             let path = String::from_utf8(entry.path().into_os_string().into_encoded_bytes())
                 .with_context(|| {
-                    self.error_ctx_frag = Some(dir_attr.name.clone());
                     format!(
                         "directory `{dir}` contains a file with a non-UTF8 name: {:?}",
-                        entry.path()
+                        entry.path(),
                     )
                 })?
                 .into_boxed_str();
@@ -389,11 +433,10 @@ impl Compiler {
         let loop_template = take(&mut element.body);
         let mut expanded_body = Vec::new();
         for (i, path) in file_paths.iter().enumerate() {
-            self.error_ctx_frag = Some(iter_var_name.clone());
             self.lua_ctx.set_var(&iter_var_name, path)?;
             let mut i_str = InlineStr::<15>::default();
             write!(i_str, "{i}")?;
-            self.lua_ctx.set_var("index", &i_str)?;
+            self.lua_ctx.set_var(&StrView::from("index"), &i_str)?;
 
             let mut new_body_piece = loop_template.clone();
             for node in &mut new_body_piece {
@@ -407,11 +450,11 @@ impl Compiler {
     }
 
     fn compile_children_element(&mut self, element: &mut Element) -> Result {
-        self.forbid_children_in_element(element)?;
+        forbid_children_in_element(element)?;
 
-        self.error_ctx_frag = Some(take(&mut element.name));
+        let element_name = take(&mut element.name);
         let Some(expansion) = self.template_expansions.last() else {
-            bail!("`<$children>` outside of a template");
+            bail!(span: element_name, "`<{}>` outside of a template", element.name);
         };
 
         element.body = expansion.body.clone();
@@ -425,13 +468,7 @@ impl Compiler {
         if !element.attrs.is_empty() {
             let mut attrs = take(&mut element.attrs).into_vec();
             let new_element_name_attr = attrs.remove(0);
-            if let Some(value_part) = new_element_name_attr.value.parts.first() {
-                self.error_ctx_frag = Some(value_part.as_text().clone());
-                bail!(
-                    "Expected an element name, got an attribute with a value. \
-                       Remove `=` and the text after it"
-                );
-            }
+            self.get_flag_value(&new_element_name_attr, &mut None)?;
 
             element.name = new_element_name_attr.name;
             element.attrs = attrs.into();
@@ -448,50 +485,46 @@ impl Compiler {
     }
 
     fn compile_register_asset_ext_element(&mut self, element: &mut Element) -> Result {
-        self.forbid_children_in_element(element)?;
+        forbid_children_in_element(element)?;
 
-        self.error_ctx_frag = Some(take(&mut element.name));
+        let element_name = take(&mut element.name);
         ensure!(
+            span: element_name,
             !element.attrs.is_empty(),
             "`<{}>` must have at least 1 attribute",
-            self.error_ctx_frag.display()
+            element.name,
         );
 
         for decl in take(&mut element.attrs) {
             let mut category_name_buf = None;
+            let decl_value_start = decl.value.parts.first().map(|l| l.as_text().clone().start());
             let category = self
                 .get_required_compiled_attr_value(&decl.name, decl.value, &mut category_name_buf)?
-                .parse::<AssetCategory>()?;
+                .parse::<AssetCategory>()
+                .maybe_with_span(decl_value_start.as_ref())?;
             self.asset_manager.register_asset_ext(decl.name.into_os_str_view(), category);
         }
-
-        element.name = "".into();
         Ok(())
     }
 
     fn compile_ref_element(&mut self, element: &mut Element, ref_attr_name: &str) -> Result {
-        let element_name = element.name.clone();
         let mut last_asset_category_marker = None;
         let mut last_cached_marker = None;
+        let mut cached = false;
         let mut var_name = None;
         let mut path = None;
+        let mut wrapping_template_name = None;
+        let mut wrap_in_attr_name = StrView::default();
         let mut ref_attr_name_span = None;
 
         let mut recovered_attrs = Vec::new();
         for attr in take(&mut element.attrs) {
             match &*attr.name {
                 "$cached" => {
-                    if let Some(ref marker) = last_cached_marker {
-                        self.error_ctx_frag = Some(attr.name);
-                        bail!("The `{marker}` marker was already provided");
-                    }
-
-                    self.get_flag_value(&attr)?;
-                    last_cached_marker = Some(attr.name);
+                    cached = self.get_flag_value(&attr, &mut last_cached_marker)?;
                 }
 
                 "$var" => {
-                    self.error_ctx_frag = Some(attr.name.clone());
                     self.get_required_compiled_attr_value(
                         &attr.name,
                         attr.value.clone(),
@@ -499,23 +532,22 @@ impl Compiler {
                     )?;
                 }
 
-                _ if let Ok(asset_category_marker) = attr.name.clone().strip_prefix('$') => {
-                    if let Some(ref prev_marker) = last_asset_category_marker {
-                        let e = anyhow!(
-                            "Redundant `${asset_category_marker}`, `{prev_marker}` was already provided"
-                        );
-                        self.error_ctx_frag = Some(attr.name);
-                        return Err(e);
-                    }
+                "$wrapIn" => {
+                    self.get_required_compiled_attr_value(
+                        &attr.name,
+                        attr.value,
+                        &mut wrapping_template_name,
+                    )?;
+                    wrap_in_attr_name = attr.name;
+                }
 
-                    self.get_flag_value(&attr)?;
-                    last_asset_category_marker = Some(attr.name);
+                _ if attr.name.starts_with('$') => {
+                    self.get_flag_value(&attr, &mut last_asset_category_marker)?;
                 }
 
                 _ => {
                     if &*attr.name == ref_attr_name {
                         ref_attr_name_span = Some(attr.name.clone());
-                        self.error_ctx_frag.clone_from(&ref_attr_name_span);
                         self.get_required_compiled_attr_value(
                             &attr.name,
                             attr.value.clone(),
@@ -529,30 +561,57 @@ impl Compiler {
         element.attrs = recovered_attrs.into();
 
         let (Some(path), Some(ref_attr_name_span)) = (path, ref_attr_name_span) else {
-            self.error_ctx_frag = Some(element_name);
-
-            bail!(
-                "The asset to reference is not provided. \
-                   Add an attribute in the form of `{ref_attr_name}=\"path/to/file\"`",
-            );
+            bail!(span: take(&mut element.name), "Missing `{}` attribute", ref_attr_name);
         };
-        self.error_ctx_frag = Some(ref_attr_name_span);
 
-        let not_cached = last_cached_marker.is_none();
-        if not_cached && url_scheme(&path).is_some() {
+        if !cached && url_scheme(&path).is_some() {
             return Ok(());
         }
         let asset_category = last_asset_category_marker
             .as_deref()
             .try_map(str::parse)
-            .inspect_err(|_| self.error_ctx_frag = last_asset_category_marker)?;
+            .maybe_with_span(last_asset_category_marker.as_ref())?;
 
         let normalised: StrView = rel_link_to_file_path(&path).into_owned().into();
-        let asset = self.asset_manager.add_asset(normalised.clone(), not_cached, asset_category)?;
+        let asset = self
+            .asset_manager
+            .add_asset(normalised.clone(), !cached, asset_category)
+            .with_span(&ref_attr_name_span)?;
 
-        if !not_cached {
+        if let Some(wrapping_element_name) = wrapping_template_name {
+            let template = self.templates.get(&wrapping_element_name)?;
+            ensure!(
+                span: wrap_in_attr_name,
+                template.accepts_children,
+                "Template `{}` doesn't accept children, thus it can't wrap an asset",
+                template.name,
+            );
+
+            for param in &template.params {
+                ensure!(
+                    span: wrap_in_attr_name,
+                    !param.is_required(),
+                    "Template `{}` has required parameters (e.g. `{}`), thus it can't wrap an asset",
+                     template.name,
+                     param.name,
+                );
+            }
+
+            if !asset.set_wrapping_template_name(wrapping_element_name) {
+                // TODO: make this a warning
+                bail!(
+                    span: wrap_in_attr_name,
+                    "The declared asset is raw, i.e. it won't be compiled, \
+                    and thus it can't accept the `{wrap_in_attr_name}` attribute",
+                );
+            }
+        }
+
+        if cached {
             let Some(ref_attr) = element.attr_mut(ref_attr_name) else {
-                bail!("bug: ref attr `{ref_attr_name}` disappeared from `<{}>`", element.name);
+                bail!(
+                    span: element.name.clone(),
+                    "bug: ref attr `{ref_attr_name}` disappeared from `<{}>`", element.name);
             };
             ref_attr.value = asset.path.clone().into();
         }
@@ -568,7 +627,7 @@ impl Compiler {
         if let "!DOCTYPE" | "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input"
         | "link" | "meta" | "param" | "source" | "track" | "wbr" = &*element.name
         {
-            self.forbid_children_in_element(element)?;
+            forbid_children_in_element(element)?;
         }
 
         match &*element.name {
@@ -605,10 +664,11 @@ impl Compiler {
     }
 
     fn wrap_compilation_error(&self, e: anyhow::Error) -> anyhow::Error {
-        let Some(error_ctx_frag) = &self.error_ctx_frag else {
+        let Some(span) = e.downcast_ref::<ExtraCtx<StrView>>() else {
             return e;
         };
-        let Some((path, loc)) = self.asset_manager.locate(error_ctx_frag.as_ptr()) else {
+
+        let Some((path, loc)) = self.asset_manager.locate(span.0.as_ptr()) else {
             return e;
         };
 
@@ -781,15 +841,23 @@ impl Compiler {
     }
 
     fn compile(&mut self) -> Result {
-        while let Some((src, asset)) = self.asset_manager.next_uncompiled_asset() {
+        while let Some((input, asset)) = self.asset_manager.next_uncompiled_asset() {
             let category = asset.category;
             let mut node = match category {
                 AssetCategory::Raw => continue,
-                AssetCategory::Template => Self::parse_template(src, asset)?,
+                AssetCategory::Template => Self::parse_template(input.src, asset)?,
                 AssetCategory::HtmlDocument | AssetCategory::Document => {
-                    Self::parse_document(src, &asset)?
+                    Self::parse_document(input.src, &asset)?
                 }
             };
+
+            if let Some(wrapping_template_name) = input.wrapping_template_name {
+                node = Node::Element(Element {
+                    name: format!("${wrapping_template_name}").into(),
+                    attrs: default(),
+                    body: [node].into(),
+                });
+            }
 
             self.compile_node(&mut node).map_err(|e| self.wrap_compilation_error(e))?;
 

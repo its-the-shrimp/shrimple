@@ -61,10 +61,6 @@ impl Attr {
             .parse(input)
     }
 
-    pub fn as_src_ptr(&self) -> *const u8 {
-        self.prefix_and_name.as_ptr()
-    }
-
     pub fn into_parts(self) -> (StrView, Option<TextLexeme>) {
         (self.prefix_and_name.after(self.name_start), self.value)
     }
@@ -83,10 +79,6 @@ impl Display for OpeningTagEnd {
 impl OpeningTagEnd {
     fn lex<Reason>(input: StrView) -> ParsingResult<Self, Reason> {
         one(seq!(whitespace.many(), '/'.maybe(), whitespace.many(), '>')).map_out(Self).parse(input)
-    }
-
-    pub fn as_src_ptr(&self) -> *const u8 {
-        self.0.as_ptr().wrapping_add(self.0.len() - 1 - usize::from(self.0.starts_with("/>")))
     }
 
     pub fn is_self_closing(&self) -> bool {
@@ -142,12 +134,6 @@ impl TextLexeme {
     pub fn into_text(self) -> StrView {
         match self {
             Self::Var(view) | Self::Expr(view) | Self::Text(view) => view,
-        }
-    }
-
-    pub fn as_src_ptr(&self) -> *const u8 {
-        match self {
-            Self::Var(s) | Self::Expr(s) | Self::Text(s) => s.as_ptr(),
         }
     }
 }
@@ -223,13 +209,12 @@ impl Lexeme {
             .parse(input)
     }
 
-    // TODO: do normal spans
-    pub fn as_src_ptr(&self) -> *const u8 {
+    pub fn into_text(self) -> StrView {
         match self {
-            Self::Attr(attr) => attr.as_src_ptr(),
-            Self::OpeningTagEnd(tag) => tag.as_src_ptr(),
-            Self::Text(textlike) => textlike.as_src_ptr(),
-            Self::OpeningTagStart(s) | Self::ClosingTag(s) => s.as_ptr(),
+            Self::ClosingTag(span) | Self::OpeningTagStart(span) => span,
+            Self::Attr(attr) => attr.into_parts().0,
+            Self::OpeningTagEnd(opening_tag_end) => opening_tag_end.0,
+            Self::Text(l) => l.into_text(),
         }
     }
 }
@@ -274,8 +259,7 @@ fn wrap_parsing_error(e: &ParsingError<impl Input, Expected>, asset: &Asset) -> 
         None => anyhow::Error::msg("bug: parsing error without reason"),
     };
 
-    let Some(loc) = asset.template_src().and_then(|src| Location::find(e.rest.as_ptr(), src))
-    else {
+    let Some(loc) = asset.src().and_then(|src| Location::find(e.rest.as_ptr(), &src)) else {
         return res;
     };
 

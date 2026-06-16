@@ -1,4 +1,4 @@
-# AGENTS.md — shrimple website generation guide
+# shrimple website generation guide
 
 `shrimple` compiles `.html` and `.md` files into a static website. Run it as:
 ```console
@@ -174,6 +174,28 @@ body { background: $PRIMARY; }
 a    { color: $(PRIMARY); }
 ```
 
+---
+
+## Keep content files clean with `$wrapIn`
+ 
+Don't put navbars, footers, or other shared layout markup inside content files.
+Define that structure once as a template, then attach it to a ref attribute with `$wrapIn`
+so the content file stays pure content:
+ 
+```html
+<$template name=withNavBar acceptsChildren>
+    <nav>...</>
+    <$children />
+</>
+ 
+<a $wrapIn=withNavBar href=post.html>A post</>
+```
+ 
+The template named in `$wrapIn` must accept children and have no required parameters.
+Reach for this whenever a page is mostly content but still needs to live inside a shared layout
+— it keeps content files DRY and separates structure/presentation concerns from the content itself,
+which matters most as a site grows or multiple files share the same layout.
+ 
 ---
 
 ## Checklist when writing a site

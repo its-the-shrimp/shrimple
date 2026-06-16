@@ -21,11 +21,19 @@ use {
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompilationInput {
+    /// The source code that should be compiled
+    pub src: StrView,
+    /// The name of a template that will wrap the content of the file. Must be valid.
+    pub wrapping_template_name: Option<StrView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssetState {
     /// An asset that should be copied as is
     Raw,
     /// A template not yet compiled
-    Template { src: StrView },
+    Compileable(CompilationInput),
     /// A template already compiled
     Compiled { src: StrView, res: StrView },
 }
@@ -72,17 +80,18 @@ pub struct Asset {
 }
 
 impl Asset {
-    pub const fn template_src(&self) -> Option<&StrView> {
+    pub fn src(&self) -> Option<StrView> {
         match &self.state {
-            AssetState::Template { src } => Some(src),
-            _ => None,
+            AssetState::Compileable(input) => Some(input.src.clone()),
+            AssetState::Compiled { src, .. } => Some(src.clone()),
+            AssetState::Raw => None,
         }
     }
 
-    pub fn src(&self) -> Option<StrView> {
+    pub const fn compilation_input(&self) -> Option<&CompilationInput> {
         match &self.state {
-            AssetState::Template { src } | AssetState::Compiled { src, .. } => Some(src.clone()),
-            AssetState::Raw => None,
+            AssetState::Compileable(input) => Some(input),
+            _ => None,
         }
     }
 
@@ -92,9 +101,18 @@ impl Asset {
 
     pub fn set_compilation_result(&mut self, res: StrView) {
         self.state = match replace(&mut self.state, AssetState::Raw) {
-            AssetState::Template { src } => AssetState::Compiled { src, res },
+            AssetState::Compileable(input) => AssetState::Compiled { src: input.src, res },
             other => other,
         };
+    }
+
+    /// Returns `true` if the asset is to be compiled & the template name was set, `false` otherwise
+    pub fn set_wrapping_template_name(&mut self, name: StrView) -> bool {
+        if let AssetState::Compileable(input) = &mut self.state {
+            input.wrapping_template_name = Some(name);
+            return true;
+        }
+        false
     }
 }
 
@@ -144,14 +162,16 @@ impl AssetManager {
     }
 
     /// The function will return the same value until `set_compilation_result` is called
-    pub fn next_uncompiled_asset(&self) -> Option<(StrView, Asset)> {
+    pub fn next_uncompiled_asset(&self) -> Option<(CompilationInput, Asset)> {
         self.assets
             .iter()
-            .find_map(|asset| asset.template_src().map(|src| (src.clone(), asset.clone())))
+            .find_map(|asset| asset.compilation_input().map(|i| (i.clone(), asset.clone())))
     }
 
     pub fn save_compilation_result(&mut self, res: impl Display) {
-        if let Some(asset) = self.assets.iter_mut().find(|asset| asset.template_src().is_some()) {
+        if let Some(asset) =
+            self.assets.iter_mut().find(|asset| asset.compilation_input().is_some())
+        {
             asset.set_compilation_result(format!("{res:#}").into());
         }
     }
@@ -205,7 +225,9 @@ impl AssetManager {
             is_local,
             category.is_some_and(|c| c != AssetCategory::Raw),
         )?;
-        let state = src.map_or(AssetState::Raw, |src| AssetState::Template { src });
+        let state = src.map_or(AssetState::Raw, |src| {
+            AssetState::Compileable(CompilationInput { src, wrapping_template_name: None })
+        });
         let mut path = path_or_url;
         let mut url = None;
         if !is_local {
@@ -278,7 +300,7 @@ impl AssetManager {
                     }
                 }
 
-                AssetState::Template { .. } => {
+                AssetState::Compileable { .. } => {
                     bail!("bug: tried to save results to disk before compiling all the assets")
                 }
 

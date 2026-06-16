@@ -41,14 +41,29 @@ you can use a `link` element just like you would in regular HTML:
 There is no special element for this, it's that shrimple.
 
 By default, the asset will be assigned a category according to the rule above;
-to force template expansion, provide a `$template` attribute before the asset declaration:
-```html
-<link $template href=shrimp.png />
-```
-Likewise, to forbid template expansion in the asset, i.e. declare the asset as a raw one,
+
+To forbid template expansion in the asset, i.e. declare the asset as a raw one,
 provide a `$raw` attribute before the asset declaration:
 ```html
 <link $raw href=shrimp.png />
+```
+
+To force Lua code evaluation, provide a `$template` attribute before the asset declaration:
+```html
+<link $template href=shrimp.png />
+```
+
+To force Lua code evaluation AND template expansion, provide a `$document` attribute (The linked asset must have an XML document structure:
+```html
+<link $document href=shrimp.txt />
+```
+
+To force the compiler to treat the asset as an HTML/Markdown document,
+i.e. evaluate Lua code, expand templates, compile Markdown
+& adapt the document structure to that of a standard HTML document,
+provide an `$htmldocument` attribute
+```html
+<a $htmldocument href=shrimp.svg>Clicky clicky</>
 ```
 
 To assign the actual path to the asset (relative to website root) to a Lua variable,
@@ -57,7 +72,20 @@ place a `$var` attribute before the reference attribute & provide the variable p
 <link $var=SHRIMP_PATH href=shrimp.png />
 ```
 
-All 3 examples will register `shrimp.png` (relative to the specified root) as an asset
+To wrap the whole asset's source code in a template, instead of doing that in the file itself,
+you can provide the template name in a `$wrapIn` attribute before the ref attribute. This is useful
+to keep your website structure DRY & separate the actual content files from the structure
+definition files, allowing for, as an example, a better separation of responsibilities in a team of 
+developers.
+```html
+<$template name=withNavBar acceptsChildren>
+    <nav>todo</>
+    <$children />
+</>
+
+<a $wrapIn=withNavBar href=post.html>A post</>
+```
+The template must accept children & not have any required parameters.
 
 ### Reference attributes
 Reference attributes are attributes that reference an asset. Such attributes, despite not being

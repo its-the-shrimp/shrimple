@@ -75,3 +75,37 @@ pub fn collect_template_expansion_info<'asset>(
 
     anyhow::Error::msg(msg)
 }
+
+pub trait AnyhowResultExt {
+    fn with_span(self, span: &StrView) -> Self;
+    fn maybe_with_span(self, span: Option<&StrView>) -> Self;
+}
+
+impl<T> AnyhowResultExt for anyhow::Result<T> {
+    fn with_span(self, span: &StrView) -> Self {
+        self.map_err(|e| e.context(ExtraCtx(span.clone())))
+    }
+
+    fn maybe_with_span(self, span: Option<&StrView>) -> Self {
+        match span {
+            Some(span) => self.with_span(span),
+            None => self,
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! bail {
+    (span: $span:expr, $($fmt:tt)*) => {
+        return Err(anyhow::anyhow!($($fmt)*).context($crate::error::ExtraCtx($span)))
+    };
+}
+
+#[macro_export]
+macro_rules! ensure {
+    (span: $span:expr, $cond:expr, $($fmt:tt)*) => {
+        if !$cond {
+            return Err(anyhow::anyhow!($($fmt)*).context($crate::error::ExtraCtx($span)));
+        }
+    };
+}

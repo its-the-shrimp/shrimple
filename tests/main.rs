@@ -22,3 +22,8 @@ fn unicode() {
 fn unquoted_attr_value_with_slash() {
     run_test("tests/samples/unquoted_attr_value_with_slash");
 }
+
+#[test]
+fn wrap_in_attr() {
+    run_test("tests/samples/wrap_in_attr");
+}

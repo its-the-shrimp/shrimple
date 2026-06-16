@@ -94,11 +94,39 @@ impl<T> OptionExt<T> for Option<T> {
     }
 }
 
-pub trait ResultExt<T> {
+pub trait ResultExt<T, E> {
+    fn adapt_err(self) -> Result<T, anyhow::Error>
+    where
+        anyhow::Error: From<E>;
+
+    fn flatten<T1, E1>(self) -> Result<T1, E>
+    where
+        T: Into<Result<T1, E1>>,
+        E1: Into<E>;
+}
+
+impl<T, E> ResultExt<T, E> for Result<T, E> {
+    fn adapt_err(self) -> Result<T, anyhow::Error>
+    where
+        anyhow::Error: From<E>,
+    {
+        self.map_err(anyhow::Error::from)
+    }
+
+    fn flatten<T1, E1>(self) -> Result<T1, E>
+    where
+        T: Into<Result<T1, E1>>,
+        E1: Into<E>,
+    {
+        self.and_then(|inner| inner.into().map_err(E1::into))
+    }
+}
+
+pub trait HomogenousResultExt<T> {
     fn merge(self) -> T;
 }
 
-impl<T> ResultExt<T> for Result<T, T> {
+impl<T> HomogenousResultExt<T> for Result<T, T> {
     fn merge(self) -> T {
         match self {
             Ok(x) | Err(x) => x,

@@ -1,3 +1,9 @@
+---
+name: shrimple-website-development
+description: Specifies how to develop websites using `shrimple` website generator.
+compatibility: Requires shrimple installed via Cargo
+---
+
 # shrimple website generation guide
 
 `shrimple` compiles `.html` and `.md` files into a static website. Run it as:
@@ -208,3 +214,8 @@ which matters most as a site grows or multiple files share the same layout.
 - Synchronise HTML & CSS by urilising `$` variables
 - Cache any external images or fonts with `$cached`
 - Omit `.html` from internal links
+
+---
+
+See [the documentation](https://github.com/its-the-shrimp/shrimple/tree/master/docs) for more
+details.

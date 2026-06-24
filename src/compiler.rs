@@ -564,7 +564,7 @@ impl Compiler {
             bail!(span: take(&mut element.name), "Missing `{}` attribute", ref_attr_name);
         };
 
-        if !cached && url_scheme(&path).is_some() {
+        if !cached && url_scheme(&path).is_some() || path.starts_with('#') {
             return Ok(());
         }
         let asset_category = last_asset_category_marker

@@ -1,6 +1,6 @@
 use {
-    crate::{asset::Asset, lexer::Expected, view::StrView},
-    shrimple_parser::{FullLocation, FullParsingError, Location},
+    crate::{asset::Asset, view::StrView},
+    shrimple_parser::{FullLocation, Location},
     std::{
         backtrace::BacktraceStatus,
         fmt::{Debug, Display, Formatter, Write},
@@ -12,8 +12,8 @@ use {
 pub struct ExtraCtx<T>(pub T);
 
 impl<T> Display for ExtraCtx<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str("<not an error>")
+    fn fmt(&self, _: &mut Formatter<'_>) -> std::fmt::Result {
+        Ok(())
     }
 }
 
@@ -25,8 +25,8 @@ impl<T: Debug> std::error::Error for ExtraCtx<T> {}
 pub struct Expansions(pub Arc<[StrView]>);
 
 impl Display for Expansions {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<not an error, but Expansions>")
+    fn fmt(&self, _: &mut Formatter<'_>) -> std::fmt::Result {
+        Ok(())
     }
 }
 
@@ -36,20 +36,15 @@ pub fn collect_template_expansion_info<'asset>(
     error: &anyhow::Error,
     assets: impl IntoIterator<Item = &'asset Asset, IntoIter: Clone>,
 ) -> anyhow::Error {
-    let root = error.root_cause();
-
-    // the `\r` is prepended to discard the "Error: " that Rust prints before printing an error
-    // returned from `main`
-    let (mut msg, loc) = match root.downcast_ref::<FullParsingError<'static, Expected>>() {
-        Some(err) => (
-            err.reason.map_or_else(|| "\rthis is a bug :3".to_owned(), |x| format!("\rerror: {x}")),
-            Some(&err.loc),
-        ),
-        None => (
-            format!("\rerror: {root}"),
-            error.downcast_ref::<ExtraCtx<FullLocation<'static>>>().map(|x| &x.0),
-        ),
-    };
+    let mut msg = "\rerror".to_owned();
+    for ctx in error.chain() {
+        let ctx_str = ctx.to_string();
+        if ctx_str.is_empty() {
+            continue;
+        }
+        _ = write!(msg, ": {ctx_str}");
+    }
+    let loc = error.downcast_ref::<ExtraCtx<FullLocation<'static>>>().map(|x| &x.0);
 
     if let Some(loc) = loc {
         _ = write!(&mut msg, "\n{}", loc.with_source_line());

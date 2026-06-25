@@ -4,6 +4,11 @@ mod common;
 use common::run_test;
 
 #[test]
+fn heading_ids() {
+    run_test("tests/samples/heading_ids");
+}
+
+#[test]
 fn hello_world() {
     run_test("tests/samples/hello_world");
 }

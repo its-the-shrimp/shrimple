@@ -42,9 +42,9 @@ impl Default for LuaCtx {
 impl LuaCtx {
     fn with_var<R>(&self, name: &StrView, f: impl FnOnce(&str) -> R) -> Result<R> {
         let res = (|| -> Result<R> {
-            let str = self.inner.globals().raw_get::<&str, Option<mlua::String>>(name)?;
+            let str = self.inner.globals().raw_get::<Option<mlua::String>>(&**name)?;
             Ok(match str {
-                Some(s) => f(s.to_str()?),
+                Some(s) => f(&s.to_str()?),
                 None => f(""),
             })
         })();
@@ -60,7 +60,7 @@ impl LuaCtx {
             Ok(match self.inner.load(&**code).set_name("").eval()? {
                 Value::Nil => f(""),
 
-                Value::String(s) => f(s.to_str()?),
+                Value::String(s) => f(&s.to_str()?),
 
                 Value::Integer(i) => {
                     let mut str = InlineStr::<64>::default();
@@ -623,6 +623,57 @@ impl Compiler {
         Ok(())
     }
 
+    fn extract_text_content<F>(nodes: &[Node], callback: &mut F)
+    where
+        F: FnMut(&str),
+    {
+        for node in nodes {
+            match node {
+                Node::Element(element) => {
+                    // Recursively extract text from nested elements
+                    Self::extract_text_content(&element.body, callback);
+                }
+                Node::Text(text) => {
+                    // After compilation, text should have only Text lexemes
+                    for part in &text.parts {
+                        if let TextLexeme::Text(t) = part {
+                            callback(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn compile_h_element(element: &mut Element) {
+        if element.attr("id").is_some() {
+            return;
+        }
+
+        let mut id = String::new();
+        Self::extract_text_content(&element.body, &mut |text| {
+            for c in text.chars() {
+                if c.is_ascii_alphanumeric() {
+                    id.push(c.to_ascii_lowercase());
+                } else if c == ' ' {
+                    id.push('-');
+                }
+                // Ignore non-alphanumeric characters and HTML tags
+            }
+        });
+        if !id.is_empty() {
+            let mut attrs = element.attrs.to_vec();
+            attrs.push(Attr {
+                name: "id".into(),
+                value: Text {
+                    parts: [TextLexeme::Text(id.into())].into(),
+                    indent_level: 0,
+                },
+            });
+            element.attrs = attrs.into_boxed_slice();
+        }
+    }
+
     fn compile_element(&mut self, element: &mut Element) -> Result {
         if let "!DOCTYPE" | "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input"
         | "link" | "meta" | "param" | "source" | "track" | "wbr" = &*element.name
@@ -639,6 +690,7 @@ impl Compiler {
             "a" | "image" | "use" | "link" => self.compile_ref_element(element, "href")?,
             "img" | "script" => self.compile_ref_element(element, "src")?,
             "form" => self.compile_ref_element(element, "action")?,
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => Self::compile_h_element(element),
 
             template if template.starts_with('$') => self.expand_template(element)?,
 

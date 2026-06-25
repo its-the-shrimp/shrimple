@@ -1,6 +1,6 @@
 [package]
 name = "shrimple"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 description = "Minimal CLI for static website generation, supercharged with Lua"
 authors = ["Tim Kurdov <tim.kurdov@gmail.com>"]
@@ -13,9 +13,9 @@ categories = ["template-engine", "compilers", "command-line-interface", "web-pro
 shrimple-parser = "0.1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-mlua = { version = "0.9", features = ["lua54"] }
+mlua = { version = "0.11", features = ["lua55", "anyhow"] }
 shrimple-localhost = "5"
-notify = "6"
+notify = "8"
 reqwest = { version = "0.13", features = ["blocking", "gzip", "deflate", "brotli"] }
 tokio = { version = "1", features = ["fs", "rt", "macros"] }
 futures-util = { version = "0.3", default-features = false }

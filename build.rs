@@ -1,4 +1,4 @@
-#[cfg(feature = "regen-tests")]
+#[cfg(debug_assertions)]
 fn main() -> anyhow::Result<()> {
     use anyhow::Context;
     use std::fs::{File, read_dir};
@@ -17,5 +17,5 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "regen-tests"))]
+#[cfg(not(debug_assertions))]
 fn main() {}
